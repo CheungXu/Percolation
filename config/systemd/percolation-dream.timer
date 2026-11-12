@@ -1,0 +1,13 @@
+# 模板，尚未启用。启用：
+#   cp config/systemd/percolation-dream.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now percolation-dream.timer
+[Unit]
+Description=Run Percolation dreaming at 03:30 every night
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

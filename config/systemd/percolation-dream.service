@@ -1,0 +1,12 @@
+# 模板，尚未启用。由 percolation-dream.timer 每晚触发，处理全部脏租户。
+[Unit]
+Description=Percolation nightly dreaming
+After=network-online.target remote-fs.target
+Requires=remote-fs.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/Percolation
+ExecStart=/root/Percolation/code/.venv/bin/python script/percolation_cli.py dream --all
+TimeoutStartSec=2h
+Nice=10

@@ -1,0 +1,17 @@
+# 模板，尚未启用。启用：
+#   cp config/systemd/percolation-api.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now percolation-api.service
+[Unit]
+Description=Percolation search and capture API
+After=network-online.target remote-fs.target
+Requires=remote-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Percolation/code
+ExecStart=/root/Percolation/code/.venv/bin/uvicorn percolation.api:app --host 127.0.0.1 --port 8710
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

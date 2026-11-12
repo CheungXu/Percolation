@@ -1,0 +1,22 @@
+:root { --primary: #6e56cf; --primary-weak: #f1edfd; --primary-line: #d9d0f7; }
+.layout { display: grid; grid-template-columns: 208px 1fr; min-height: 100vh; }
+.side { background: #fff; border-right: 1px solid var(--line); position: sticky; top: 0; height: 100vh; overflow: auto; }
+.logo { height: 56px; display: flex; align-items: center; gap: 8px; padding: 0 18px; font-weight: 700; font-size: 15px; color: var(--primary); border-bottom: 1px solid var(--line-2); }
+.logo .mark { width: 22px; height: 22px; border-radius: 6px; background: var(--primary); color: #fff; display: grid; place-items: center; font-size: 12px; }
+.menu { padding: 10px 8px; }
+.menu .group { color: var(--text-3); font-size: 12px; padding: 14px 12px 6px; }
+.menu a { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 12px; border-radius: 6px; color: var(--text-2); }
+.menu a:hover { background: var(--gray-bg); color: var(--text); }
+.menu a.on { background: var(--primary-weak); color: var(--primary); font-weight: 600; }
+.top { height: 56px; background: #fff; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; padding: 0 24px; position: sticky; top: 0; z-index: 5; }
+.top .crumb { color: var(--text-3); display: flex; align-items: center; gap: 6px; }
+.top .crumb b { color: var(--text); }
+.content { padding: 20px 24px 40px; max-width: 1360px; }
+.toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 16px; }
+.toolbar label { color: var(--text-2); }
+.split { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; align-items: start; }
+.split-ctx { display: grid; grid-template-columns: 220px 360px minmax(0, 1fr); gap: 14px; align-items: start; }
+.navlist a { display: block; padding: 8px 12px; border-radius: 6px; color: var(--text-2); }
+.navlist a.on { background: var(--primary-weak); color: var(--primary); font-weight: 600; }
+.navlist .grp { font-size: 12px; color: var(--text-3); padding: 10px 12px 4px; }
+.sticky { position: sticky; top: 76px; }
