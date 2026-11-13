@@ -20,7 +20,7 @@ from agentkit.context import RunContext
 from agentkit.llm.chat import ChatClient
 from agentkit.llm.pricing import cost_of
 from agentkit.llm.types import ChatResponse, ToolCall, Usage
-from agentkit.tools import Tool, ToolOutcome
+from agentkit.tools import SIDE_EFFECT_TAG, Tool, ToolOutcome
 
 T = TypeVar("T")
 
@@ -31,6 +31,7 @@ OUTPUT_INSTRUCTION = """## 最终输出
 EXHAUSTED_MESSAGE = "工具调用轮数已用完。不要再调用工具，基于目前掌握的信息直接给出最终输出。"
 REPAIR_MESSAGE = "上一条回复不符合输出要求：{error}\n请只回复一个符合 Schema 的 JSON 对象。"
 BLOCKED_MESSAGE = "ERROR: 这个调用和前面 {count} 次完全相同（同工具同参数），结果不会变化，已拦截。请换个参数、换个工具，或直接给出结论。"
+REPLAY_BLOCKED_MESSAGE = "ERROR: 当前是回放运行，这个工具会产生外部副作用，已拦截。请直接基于已有信息继续。"
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
@@ -198,6 +199,9 @@ async def run_agent(
                     outcome = ToolOutcome.error(f"ERROR: 没有名为 {tool_call.name} 的工具")
                 elif repeat > spec.max_identical_tool_calls:
                     outcome = ToolOutcome.error(BLOCKED_MESSAGE.format(count=repeat - 1), blocked=True)
+                elif ctx.replay and SIDE_EFFECT_TAG in target.tags:
+                    outcome = ToolOutcome.error(REPLAY_BLOCKED_MESSAGE, blocked=True)
+                    tool_span.set(replay_blocked=True)
                 else:
                     outcome = await target.invoke_full(tool_call.arguments, ctx)
                 tool_span.set(

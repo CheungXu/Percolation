@@ -18,6 +18,7 @@ class RunContext:
 
     deps 放业务自己的依赖（连接池、检索器等），agentkit 不关心它的类型。
     chat_clients 可按槽位注入替身客户端，单测用。
+    replay=True 表示复现运行：带 side_effect 标签的工具（发消息、调外部写接口）会被循环拦截。
     """
 
     tenant_id: str | None = None
@@ -27,6 +28,7 @@ class RunContext:
     trace: Trace = field(default_factory=Trace)
     deps: Any = None
     chat_clients: dict[str, ChatClient] = field(default_factory=dict)
+    replay: bool = False
 
     def chat_for(self, slot: str, params: dict[str, Any] | None = None) -> ChatClient:
         if slot in self.chat_clients:

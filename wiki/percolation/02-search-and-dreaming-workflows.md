@@ -83,8 +83,10 @@ flowchart TD
 2. **双节奏自动切换（`incremental` vs. `defrag`）**：
    - 日常默认走 **`incremental`（增量小改）**：只归档新消息、单点晋升近 14 天命中 ≥ 2 次的候选缓存词条。
    - 满足以下任一条件自动升级为 **`defrag`（全局重整）**：① `MEMORY.md` 行数超过软上限（180 行，即 200 行硬上限的 90%）；② `wiki_links` 中悬空死链数 ≥ 5；③ 距上次 `last_defrag_at`（或建号时间）已满 7 天。
-3. **文件即本体，数据库即索引**：大模型只负责读写人类可读的 Markdown 文件；切片、算哈希、调向量接口与构建链接边表全部由确定性 Python 代码 `indexer.sync_wiki()` 完成，且通过 `content_hash`（SHA-256）保证未改动的小节零重复向量开销。
-4. **锚点双向对账 + 异常整体回滚**：不盲信模型口头汇报的“已归档列表”，代码会扫描工作区所有 Markdown 文件中实际落盘的 `#msg_N` 锚点与模型汇报取并集；任一步骤抛出异常时，立即执行 `git reset --hard` + `git clean -fd` 回退工作区文件并重跑 `sync_wiki()`，保证文件、向量索引与原话 `pending` 状态三者严格一致。
+3. **文件即本体，数据库即索引**：大模型只负责读写人类可读的 Markdown 文件；切片、算哈希、调向量接口与构建链接边表全部由确定性 Python 代码完成，分成不写库的 `plan_sync()` 和在调用方事务里执行的 `apply_sync()`，通过 `content_hash`（SHA-256）保证未改动的小节零重复向量开销。
+4. **暂存写入 + 单事务发布**：整理全程写在独立 git worktree（`staging/<uid>/<run_id>`）里，检索只读主工作区和已发布索引，看不到半成品。收尾时先在暂存分支提交，再用**一个事务**刷新六张派生表、推进原话状态并登记 `users.workspace_head`，事务提交后主工作区 `merge --ff-only`。发布前任一步失败只需删掉暂存区，主工作区与索引从没被碰过；快进中断由下一次整理按 `workspace_head` 补齐；检索开头发现主工作区落后，也会在拿得到整理锁时先补快进再检索。
+5. **锚点双向对账**：不盲信模型口头汇报的“已归档列表”，代码会扫描暂存区所有 Markdown 文件中实际落盘的 `#msg_N` 锚点与模型汇报取并集。
+6. **可复现**：开跑前把工作区版本、库水位（`as_of`、最大原话序号、pending 集合）、代码/依赖/配置指纹与模式判定理由记进轨迹根 span；时间相关判断都用注入的 `as_of`。`trace_cli.py reproduce` 据此在 `replay-*` 租户里重建现场重跑对比。
 
 ### 2.2 夜间离线整理完整流程图
 
@@ -93,35 +95,41 @@ flowchart TD
   Trigger["夜间 03:30 定时器或手动 CLI dream"] --> ScanDirty["Phase 0: 调受控函数 list_dirty_users() 获取脏租户列表"]
   ScanDirty --> TryLock{"pg_try_advisory_lock(独占连接会话锁)"}
   TryLock -->|"已被占用"| SkipLocked["返回 status=locked 跳过"]
-  TryLock -->|"获取成功"| LoadState["读取 pending 原话、悬空链接数、MEMORY.md 行数与近 14 天缓存命中统计"]
+  TryLock -->|"获取成功"| Prepare["准备主工作区: 清残留 index.lock -> 按 workspace_head 补快进 -> 人工改动先提交并发布索引"]
+  Prepare --> Anchor["记执行环境锚点: 工作区版本 / 库水位 as_of、max_msg_seq、pending 集合 / 代码与配置指纹"]
+  Anchor --> LoadState["读取水位内 pending 原话、悬空链接数、MEMORY.md 行数与 as_of 前 14 天缓存命中统计"]
 
-  LoadState --> ModeSelect["判定运行模式: MEMORY.md > 180行 或 悬空链接 >= 5 或 距上次重整 >= 7天 -> defrag, 否则 incremental"]
+  LoadState --> ModeSelect["decide_mode(as_of): MEMORY.md > 180行 或 悬空链接 >= 5 或 距上次重整 >= 7天 -> defrag, 否则 incremental; 模式与理由写进锚点"]
   ModeSelect --> CheckNoop{"pending 为空 且 无晋升/重整需求?"}
   CheckNoop -->|"是"| FinalNoop["清脏标记并返回 status=noop"]
   CheckNoop -->|"否"| InsertRun["写入 dream_runs(status=running)"]
 
-  InsertRun --> Phase1["Phase 1 上下文拼图归档: 按 batch_id 分组(每组<=40条, 不拆同批次)循环调 run_agent(dream_archive)"]
+  InsertRun --> Staging["建暂存 worktree: staging/uid/run_id, 分支 dream/run_id"]
+  Staging --> Phase1["Phase 1 上下文拼图归档(写暂存区): 按 batch_id 分组(每组<=40条, 不拆同批次)循环调 run_agent(dream_archive)"]
   Phase1 --> Phase1Detail["先读 read_skill(wiki-format) -> 结合热区与已有页面更新 wiki/*.md (补 aliases、标 confirmed/inferred 与 #msg_N) -> 澄清暗语写入 MEMORY_CACHE/*.md"]
 
-  Phase1Detail --> Phase2["Phase 2 确定性索引同步: indexer.sync_wiki()"]
-  Phase2 --> Phase2Detail["解析 frontmatter/小节/链接/锚点 -> SHA256 content_hash 比对 -> 仅对变更切片调 text-embedding-v4 -> 刷新 wiki_chunks 与 wiki_links"]
+  Phase1Detail --> Phase2["Phase 2 索引计划: plan_sync() 不写库"]
+  Phase2 --> Phase2Detail["解析 frontmatter/小节/链接/锚点 -> content_hash 比对 -> 仅对新切片调 text-embedding-v4 -> 预算悬空链接"]
 
   Phase2Detail --> CheckTier{"需要冷热升降级?(有 >=2 次命中候选 或 热区 >180行 或 defrag)"}
   CheckTier -->|"否"| Phase4
   CheckTier -->|"是"| Phase3["Phase 3 冷热置换: run_agent(dream_tiering 或 dream_tiering_defrag)"]
-  Phase3 --> Phase3Detail["14天内命中 >=2 次的 confirmed 词条移入 MEMORY.md; 超水位冷条目下沉回 MEMORY_CACHE/; defrag 模式合并重复页并修死链"]
-  Phase3Detail --> CheckWikiChanged{"Phase 3 改动了 wiki/?"}
-  CheckWikiChanged -->|"是"| ResyncWiki["再次运行 sync_wiki() 累加统计并同步索引"]
-  CheckWikiChanged -->|"否"| Phase4
-  ResyncWiki --> Phase4
+  Phase3 --> Phase3Detail["14天内命中 >=2 次的 confirmed 词条移入 MEMORY.md; 超水位冷条目下沉回 MEMORY_CACHE/; defrag 按暂存区维度分布合并近义标签、合并重复页并修死链"]
+  Phase3Detail --> CheckDefrag{"defrag?"}
+  CheckDefrag -->|"是"| Replan["再算一次 plan_sync()(向量缓存复用)"]
+  CheckDefrag -->|"否"| Phase4
+  Replan --> Phase4
 
-  Phase4["Phase 4 锚点对账与单事务推进: 扫描工作区文件实际出现的 #msg_N 与模型汇报取并集"]
-  Phase4 --> TxUpdate["单事务更新 raw_messages(archived / skipped)、重算 pending_msg_count、清零 pending_cache_hits、更新 dream_runs(succeeded)"]
-  TxUpdate --> GitCommit["Phase 5 工作区版本快照: git add -A && git commit"]
+  Phase4["Phase 4 锚点对账: 扫描暂存区文件实际出现的 #msg_N 与模型汇报取并集"]
+  Phase4 --> Commit["暂存分支 git commit"]
+  Commit --> TxUpdate["Phase 5 单事务发布: apply_sync 刷新六张派生表 + raw_messages(archived / skipped) + 计数 + dream_runs(succeeded) + users.workspace_head"]
+  TxUpdate --> FF["主工作区 merge --ff-only -> gc --auto -> 删暂存区"]
+  FF -.->|"快进失败"| KeepBranch["保留分支并在结果 error 里注明, 下次 Prepare 或检索补快进"]
 
-  Phase1 -.->|"任一步抛异常"| Rollback["异常回滚: git reset --hard + git clean -> sync_wiki 恢复索引 -> dream_runs 记 failed (原话保持 pending)"]
-  Phase2 -.->|"任一步抛异常"| Rollback
-  Phase3 -.->|"任一步抛异常"| Rollback
+  Phase1 -.->|"发布前任一步抛异常"| Rollback["删暂存区与分支 -> dream_runs 记 failed (主工作区与索引未动, 原话保持 pending)"]
+  Phase2 -.->|"发布前任一步抛异常"| Rollback
+  Phase3 -.->|"发布前任一步抛异常"| Rollback
+  TxUpdate -.->|"事务失败"| Rollback
 ```
 
 ### 2.3 真机实测性能基线（广州轻量服务器 + 百炼模型通道）

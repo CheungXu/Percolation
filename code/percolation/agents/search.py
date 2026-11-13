@@ -13,13 +13,15 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from functools import cache
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from agentkit import AgentSpec, RunContext, Trace, run_agent
-from percolation import retriever
+from agentkit.workspace import Workspace
+from percolation import env_anchor, retriever
 from percolation.agents import load_prompt
 from percolation.memory_fs import CACHE_DIR, MEMORY_FILE
 from percolation.services import Services, UserRef
@@ -151,6 +153,7 @@ async def _primary(
     date_from: str | None = None,
     date_to: str | None = None,
     time_field: str = "any",
+    as_of: datetime | None = None,
 ) -> tuple[AnswerDraft, retriever.RetrievalResult]:
     result = await retriever.traced_search(
         ctx,
@@ -169,7 +172,7 @@ async def _primary(
         dim_info = " · ".join(filter(None, [dim_info, f"日期范围 {result.date_range[0] or ''}..{result.date_range[1] or ''}"]))
     prompt = "\n\n".join(
         [
-            _section("当前日期", retriever.format_local_today()),
+            _section("当前日期", retriever.format_local_today(as_of)),
             _section("热区记忆", memory),
             _section("提问", query),
             _section("补充线索", "\n".join(f"- {clue}" for clue in clues)),
@@ -183,12 +186,41 @@ async def _primary(
     return draft, result
 
 
-async def ask(services: Services, user: UserRef, query: str, *, clarification: str | None = None) -> SearchOutcome:
+async def _repair_behind(services: Services, user: UserRef, trace: Trace) -> bool:
+    """上次整理快进中断时，索引已是新版本而文件还是旧的；能补就先补齐再检索。补不了不影响检索。"""
+    from percolation.agents.dream import repair_fast_forward
+
+    try:
+        repaired = await repair_fast_forward(services, user)
+    except Exception as exc:  # noqa: BLE001
+        trace.event("workspace_repair_failed", error=services.models.redact(str(exc))[:500])
+        return False
+    if repaired:
+        trace.event("workspace_repaired")
+    return repaired
+
+
+async def ask(
+    services: Services,
+    user: UserRef,
+    query: str,
+    *,
+    clarification: str | None = None,
+    as_of: datetime | None = None,
+) -> SearchOutcome:
+    """as_of 只在复现时传：把「当前日期」钉在原运行的时刻。"""
     trace = services.new_trace("search", user, clarification=bool(clarification))
     trace.root.payload["input"] = {"query": query, "clarification": clarification}
     try:
         with trace.activate():
-            result = await _ask(services, user, trace, query, clarification)
+            ws = services.workspace(user)
+            anchor = await services.capture_env(user, ws, as_of=as_of, check_clean=True)
+            if anchor["workspace"]["workspace_mismatch"] and await _repair_behind(services, user, trace):
+                anchor = await services.capture_env(user, ws, as_of=as_of, check_clean=True)
+            env_anchor.attach(trace, anchor)
+            result = await _ask(
+                services, user, trace, query, clarification, ws=ws, as_of=datetime.fromisoformat(anchor["db"]["as_of"])
+            )
     except Exception as exc:
         error = f"{type(exc).__name__}: {services.models.redact(str(exc))}"[:2000]
         services.save_trace(user, trace, {"error": error}, status="failed")
@@ -203,9 +235,17 @@ async def ask(services: Services, user: UserRef, query: str, *, clarification: s
     return result
 
 
-async def _ask(services: Services, user: UserRef, trace: Trace, query: str, clarification: str | None) -> SearchOutcome:
+async def _ask(
+    services: Services,
+    user: UserRef,
+    trace: Trace,
+    query: str,
+    clarification: str | None,
+    *,
+    ws: Workspace,
+    as_of: datetime,
+) -> SearchOutcome:
     started = time.monotonic()
-    ws = services.workspace(user)
     ctx = services.context(user, trace, ws)
     memory = ws.read_text(MEMORY_FILE)
     clues: list[str] = []
@@ -215,7 +255,7 @@ async def _ask(services: Services, user: UserRef, trace: Trace, query: str, clar
     catalog = effective_facets_catalog(services.settings.facets, ws.read_text(f"{CACHE_DIR}/facets.md"))
     router_input = "\n\n".join(
         [
-            _section("当前日期", retriever.format_local_today()),
+            _section("当前日期", retriever.format_local_today(as_of)),
             _section("可用维度词表", format_facets_taxonomy(catalog)),
             _section("热区记忆", memory),
             _section("提问", query),
@@ -246,6 +286,7 @@ async def _ask(services: Services, user: UserRef, trace: Trace, query: str, clar
             date_from=plan.date_from,
             date_to=plan.date_to,
             time_field=plan.time_field,
+            as_of=as_of,
         )
         if draft.status != "answered" and ws.files(CACHE_DIR, "**/*.md"):
             route_path = "cache_fallback"
@@ -275,6 +316,7 @@ async def _ask(services: Services, user: UserRef, trace: Trace, query: str, clar
                     date_from=plan.date_from,
                     date_to=plan.date_to,
                     time_field=plan.time_field,
+                    as_of=as_of,
                 )
                 cache_hits = [{**hit.model_dump(), "file": _cache_rel(hit.file)} for hit in probe.cache_hits]
                 memory_clues.extend(probe.clues)

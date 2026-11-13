@@ -11,7 +11,7 @@
 | 文档 | 核心内容 | 适用场景 |
 | --- | --- | --- |
 | `01-agentkit-core-and-architecture.md` | **Agent 核心与总体分层架构**：`agentkit` 与业务层解耦原则、总体分层架构图、`run_agent` 157 行白盒工具循环流程图、核心原语（模型槽位、流式 Tool Calling、容错回灌、结构化自愈、受限工作区与 `bwrap` 沙箱、强制 RLS 事务与会话咨询锁） | 理解智能体底层运行机制，或将 `agentkit` 复用到新业务 Agent |
-| `02-search-and-dreaming-workflows.md` | **在线检索与离线整理工作流程**：碎片录入 + `Search Agent` 四步检索状态机流程图、双轨混合召回（全文 + `trgm` + `halfvec` RRF + Rerank + 一跳邻居）、`Dreaming Agent` 五步夜间整理流程图、增量/重整双节奏判定、锚点双向对账与失败整体回滚 | 排查召回链路、调整冷热晋升阈值、优化整理与检索延迟 |
+| `02-search-and-dreaming-workflows.md` | **在线检索与离线整理工作流程**：碎片录入 + `Search Agent` 四步检索状态机流程图、双轨混合召回（全文 + `trgm` + `halfvec` RRF + Rerank + 一跳邻居）、`Dreaming Agent` 夜间整理流程图（暂存 worktree + 单事务发布 + 快进）、增量/重整双节奏判定、锚点双向对账、失败隔离与执行环境锚点 | 排查召回链路、调整冷热晋升阈值、优化整理与检索延迟 |
 | `03-tools-prompts-and-skills-reference.md` | **工具矩阵、System Prompt 与 Skill 全景手册**：9 个原子工具的来源与安全边界、6 个 `AgentSpec` 节点的最小权限配置表、5 份 System Prompt 原文与设计约束、`wiki-format` 渐进式披露 Skill 规范 | 调优提示词、增删节点工具权限、扩展记忆文件解析规则 |
 
 ---

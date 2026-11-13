@@ -8,13 +8,16 @@
 
 轨迹里被外置的文本替换成 {"$ref": "sha256:...", "chars": N}，hydrate() 可还原。
 写入前先过 redact（脱敏回调），保证密钥不会落盘或导出。
+purge() 按索引行条件删轨迹（如某个回放租户），并对 blobs 做标记-清扫。
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sys
+import time
 from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +30,7 @@ from agentkit.trace import Trace, sha256_text
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 DEFAULT_BLOB_THRESHOLD = 16 * 1024
+BLOB_GRACE_SECONDS = 3600
 REF_KEY = "$ref"
 
 
@@ -130,9 +134,89 @@ class TraceStore:
         line = (json.dumps(record, ensure_ascii=False, default=str) + "\n").encode("utf-8")
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, FILE_MODE)
         try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
             os.write(fd, line)
         finally:
             os.close(fd)
+
+    # ---- 清理 ----
+    def purge(
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        *,
+        dry_run: bool = False,
+        blob_grace_seconds: int = BLOB_GRACE_SECONDS,
+    ) -> dict[str, Any]:
+        """删掉索引行满足 predicate 的轨迹，再对 blobs 做一次标记-清扫。
+
+        索引文件原地重写（同一 inode，持排他锁），并发追加会等锁而不会写进被替换的旧文件。
+        新落盘的轨迹先写 blob 后写索引，所以只清扫超过宽限期且无人引用的 blob。
+        """
+        self.ensure()
+        dropped: list[dict[str, Any]] = []
+        for index_path in sorted((self.root / "index").glob("*.runs.jsonl")):
+            with index_path.open("r+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                lines = handle.readlines()
+                keep = []
+                for line in lines:
+                    if line.strip() and predicate(json.loads(line)):
+                        dropped.append(json.loads(line))
+                    else:
+                        keep.append(line)
+                if len(keep) != len(lines) and not dry_run:
+                    handle.seek(0)
+                    handle.writelines(keep)
+                    handle.truncate()
+        trace_bytes = 0
+        for row in dropped:
+            path = self.root / row["path"]
+            if path.exists():
+                trace_bytes += path.stat().st_size
+                if not dry_run:
+                    path.unlink()
+        dropped_ids = {row["trace_id"] for row in dropped} if dry_run else set()
+        referenced = self.referenced_blobs(skip_trace_ids=dropped_ids)
+        now = time.time()
+        blobs_deleted, blob_bytes = 0, 0
+        for blob in (self.root / "blobs" / "sha256").glob("*/*.zst"):
+            digest = "sha256:" + blob.name.removesuffix(".zst")
+            stat = blob.stat()
+            if digest in referenced or now - stat.st_mtime < blob_grace_seconds:
+                continue
+            blobs_deleted += 1
+            blob_bytes += stat.st_size
+            if not dry_run:
+                blob.unlink()
+        return {
+            "traces": len(dropped),
+            "trace_bytes": trace_bytes,
+            "blobs_deleted": blobs_deleted,
+            "blob_bytes": blob_bytes,
+            "dry_run": dry_run,
+        }
+
+    def referenced_blobs(self, *, skip_trace_ids: set[str] = frozenset()) -> set[str]:
+        referenced: set[str] = set()
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                ref = value.get(REF_KEY)
+                if isinstance(ref, str) and ref.startswith("sha256:"):
+                    referenced.add(ref)
+                for item in value.values():
+                    walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        for path in (self.root / "traces").glob("*/*/*/*.json.zst"):
+            if path.name.removesuffix(".json.zst") in skip_trace_ids:
+                continue
+            data = self.load(path)
+            referenced.update(data.get("asset_refs", []))
+            walk(data.get("spans", []))
+        return referenced
 
     def _write_atomic(self, path: Path, content: bytes) -> None:
         path.parent.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
@@ -201,6 +285,8 @@ def index_record(data: dict[str, Any], rel_path: str, raw_bytes: int) -> dict[st
     spans = data.get("spans", [])
     agents = [span for span in spans if span["kind"] == "agent"]
     tools = [span for span in spans if span["kind"] == "tool"]
+    root = next((span for span in spans if span.get("parent_id") is None), {})
+    root_attrs = root.get("attributes", {})
     return {
         "trace_id": data["trace_id"],
         "name": data["name"],
@@ -223,6 +309,8 @@ def index_record(data: dict[str, Any], rel_path: str, raw_bytes: int) -> dict[st
         "tool_errors": sum(1 for span in tools if span["status"] == "error"),
         "blocked_calls": sum(1 for span in tools if span["attributes"].get("blocked")),
         "error_spans": sum(1 for span in spans if span["status"] == "error"),
+        "env_digest": root_attrs.get("env_digest"),
+        "env_watermark": root_attrs.get("env_watermark"),
         "path": rel_path,
         "bytes": raw_bytes,
     }

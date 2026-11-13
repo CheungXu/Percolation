@@ -8,13 +8,17 @@
   trace_cli.py sql "SELECT name, count(*) FROM runs GROUP BY 1"   对索引跑任意 DuckDB SQL
   trace_cli.py export-otlp <trace_id前缀...> | --since 2026-11-13   回放到 Phoenix（OTLP）
   trace_cli.py du                                         轨迹仓占用
+  trace_cli.py reproduce <trace_id前缀> [--runs 3] [--keep] [--json]   按执行环境锚点复现一次检索/整理
+  trace_cli.py purge --tenant <user_id> [--dry-run]       删某租户全部轨迹并清扫无人引用的 blob
 
+list / stats 默认不含复现产生的回放轨迹（metadata.replay_of），加 --include-replays 才包含。
 运行：code/.venv/bin/python script/trace_cli.py ...
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from collections import defaultdict
@@ -37,6 +41,10 @@ def fmt_cost(value) -> str:
     return "-" if value in (None, 0) else f"¥{value:.4f}"
 
 
+def is_replay(row: dict) -> bool:
+    return bool(row.get("metadata", {}).get("replay_of"))
+
+
 def cmd_list(args) -> None:
     store, _ = open_store()
     rows = [
@@ -45,6 +53,7 @@ def cmd_list(args) -> None:
         if (not args.name or row["name"] == args.name)
         and (not args.status or row["status"] == args.status)
         and (not args.user or row["metadata"].get("user_slug") == args.user)
+        and (args.include_replays or not is_replay(row))
     ]
     rows.sort(key=lambda row: row["started_at"], reverse=True)
     print(f"{'trace_id':12} {'started_at':19} {'name':7} {'status':14} {'ms':>7} {'llm':>4} {'tool':>4} {'tokens':>8} {'cost':>9}  user")
@@ -74,6 +83,11 @@ def cmd_show(args) -> None:
         print(f"  · {model}: {u['calls']} 次 · in {u['input_tokens']} / out {u['output_tokens']} · {fmt_cost(entry['cost'])}")
     if data["summary"]:
         print("summary:", _short(data["summary"], 400))
+    if data["metadata"].get("replay_of"):
+        print(f"回放：replay_of={data['metadata']['replay_of']} run={data['metadata'].get('replay_run')}")
+    root_attrs = next((s for s in data["spans"] if s.get("parent_id") is None), {}).get("attributes", {})
+    if root_attrs.get("env_digest"):
+        print(f"环境：digest={root_attrs['env_digest']} · {_short(root_attrs.get('env_watermark'), 300)}")
 
     children = defaultdict(list)
     for span in data["spans"]:
@@ -166,7 +180,12 @@ def _print_rows(cursor) -> None:
 def cmd_stats(args) -> None:
     store, _ = open_store()
     con = _duck(store)
-    where = f"WHERE strftime(started_at::TIMESTAMPTZ, '%Y-%m') = '{args.month}'" if args.month else ""
+    conditions = []
+    if args.month:
+        conditions.append(f"strftime(started_at::TIMESTAMPTZ, '%Y-%m') = '{args.month}'")
+    if not args.include_replays:
+        conditions.append("json_extract_string(to_json(metadata), '$.replay_of') IS NULL")
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     print("== 按运行类型 ==")
     _print_rows(
         con.execute(
@@ -197,6 +216,8 @@ def cmd_stats(args) -> None:
     models: dict[str, dict] = defaultdict(lambda: {"calls": 0, "in": 0, "out": 0, "cost": 0.0})
     fingerprints: dict[tuple[str, str], int] = defaultdict(int)
     for row in store.iter_index([args.month] if args.month else None):
+        if is_replay(row) and not args.include_replays:
+            continue
         for model, entry in row["usage_by_model"].items():
             item = models[model]
             item["calls"] += entry["usage"]["calls"]
@@ -246,6 +267,88 @@ def cmd_du(args) -> None:
         print(f"{sub:9} {len(files):>7} 个文件 {sum(p.stat().st_size for p in files) / 1024 / 1024:>9.2f} MiB")
 
 
+def print_reproduce(report: dict) -> None:
+    print(f"复现 {report['name']} {report['trace_id']} · as_of {report['as_of']}")
+    print(f"原入参：{_short(report['input'], 200)}")
+    for warning in report.get("warnings", []):
+        print(f"注意：{warning}")
+    base = report["original"]
+    print(f"\n[原运行] {_short({k: v for k, v in base.items() if k != 'fingerprints'}, 600)}")
+    for run in report["runs"]:
+        s = run["summary"]
+        diff_keys = [key for key, same in run["same"].items() if not same]
+        setup = run["setup"]
+        print(
+            f"\n[重跑 {run['run']}] trace {str(run['trace_id'])[:12]} · 租户 {run['tenant']} · {fmt_cost(s.get('cost_cny'))} · {s.get('duration_ms')} ms"
+        )
+        print(
+            f"  环境：复制检索日志 {setup['search_logs']} · 原话 {setup['raw_messages']}（pending {setup['pending']}）"
+            f" · 主题页 {setup['docs']} · 新算向量 {setup['embedded_fresh']} · 水位一致 {all(run['watermark_match'].values())}"
+        )
+        if setup.get("unmapped_replies"):
+            print(f"  有 {setup['unmapped_replies']} 条原话引用的检索日志不在水位内，关联置空")
+        print(f"  一致：{', '.join(k for k, same in run['same'].items() if same) or '无'}")
+        if diff_keys:
+            print(f"  不同：{', '.join(diff_keys)}")
+            for key in diff_keys:
+                print(f"    {key}: 原 {_short(base.get(key), 160)} → 现 {_short(s.get(key), 160)}")
+        if report["name"] == "search":
+            print(f"  回答：{_short(s.get('answer'), 200)}")
+        for item in run.get("file_diffs", []):
+            if not item["same"]:
+                print(f"  文件不同：{item['file']} +{item['added']} -{item['removed']}")
+        if run["replay_blocked_tools"]:
+            print(f"  回放拦截了 {run['replay_blocked_tools']} 次副作用工具调用")
+    print("\n[稳定性] " + " · ".join(f"{key} {count}/{len(report['runs'])}" for key, count in report["stability"].items()))
+    if report.get("env_diff"):
+        print("\n[环境差异]")
+        for item in report["env_diff"]:
+            print(f"  {item['key']}: {_short(item['original'], 80)} → {_short(item['replay'], 80)}")
+    else:
+        print("\n[环境差异] 无（代码、依赖、配置指纹与原运行一致）")
+    if report.get("old_code_hint"):
+        print("\n" + report["old_code_hint"])
+    if report.get("kept_tenants"):
+        print(f"\n已保留回放租户：{', '.join(report['kept_tenants'])}（清理：script/e2e_percolation.py --drop <slug>）")
+
+
+def cmd_reproduce(args) -> None:
+    from percolation.replay import ReplayError, reproduce
+    from percolation.services import Services
+
+    async def run() -> dict:
+        services = await Services.open(load_settings(ROOT))
+        try:
+            return await reproduce(services, args.trace_id, runs=args.runs, keep=args.keep)
+        finally:
+            await services.close()
+
+    try:
+        report = asyncio.run(run())
+    except ReplayError as exc:
+        sys.exit(f"无法复现：{exc}")
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    else:
+        print_reproduce(report)
+
+
+def cmd_purge(args) -> None:
+    from percolation.tenants import is_disposable
+
+    store, _ = open_store()
+    slugs = {row["metadata"].get("user_slug", "") for row in store.iter_index() if row.get("tenant_id") == args.tenant}
+    real = sorted(slug for slug in slugs if not is_disposable(slug))
+    if real and not args.force:
+        sys.exit(f"租户 {real} 不是 e2e-/replay- 临时租户，删除真实用户轨迹需要加 --force")
+    result = store.purge(lambda row: row.get("tenant_id") == args.tenant, dry_run=args.dry_run)
+    verb = "将删除" if args.dry_run else "已删除"
+    print(
+        f"{verb}租户 {args.tenant} 的 {result['traces']} 条轨迹（{result['trace_bytes'] / 1024:.1f} KiB），"
+        f"无人引用的 blob {result['blobs_deleted']} 个（{result['blob_bytes'] / 1024:.1f} KiB）"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Percolation NAS 轨迹仓查询")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -255,6 +358,7 @@ def main() -> None:
     p.add_argument("--status")
     p.add_argument("--user")
     p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--include-replays", action="store_true", help="包含复现产生的回放轨迹")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("show")
@@ -270,6 +374,7 @@ def main() -> None:
 
     p = sub.add_parser("stats")
     p.add_argument("--month", help="YYYY-MM")
+    p.add_argument("--include-replays", action="store_true", help="包含复现产生的回放轨迹")
     p.set_defaults(func=cmd_stats)
 
     p = sub.add_parser("sql")
@@ -284,6 +389,19 @@ def main() -> None:
 
     p = sub.add_parser("du")
     p.set_defaults(func=cmd_du)
+
+    p = sub.add_parser("reproduce", help="按执行环境锚点在临时 replay 租户里重跑并对比")
+    p.add_argument("trace_id")
+    p.add_argument("--runs", type=int, default=3, help="重跑次数，每次一个全新租户")
+    p.add_argument("--keep", action="store_true", help="保留 replay 租户与工作区，便于人工查看")
+    p.add_argument("--json", action="store_true", help="输出完整 JSON 报告")
+    p.set_defaults(func=cmd_reproduce)
+
+    p = sub.add_parser("purge", help="删除某租户的全部轨迹并清扫 blob")
+    p.add_argument("--tenant", required=True, help="租户 user_id（uuid）")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true", help="允许删除非临时租户（真实用户）的轨迹")
+    p.set_defaults(func=cmd_purge)
 
     args = parser.parse_args()
     args.func(args)

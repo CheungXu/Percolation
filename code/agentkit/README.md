@@ -57,10 +57,10 @@ TraceStore(Path("/data/telemetry")).save(ctx.trace)   # 落盘完整轨迹
 | `llm/registry.py` | 读 `models.json` 和 env 文件，按槽位取模型；`redact()` 把密钥从文本里抹掉 |
 | `llm/chat.py` | OpenAI 兼容 chat/completions，一律流式，拼回流式 tool_calls，可重试错误指数退避 |
 | `llm/embedding.py` / `llm/rerank.py` | 向量（每批 10 条）和 DashScope 原生重排；`to_vector_literal` 生成 pgvector 字面量 |
-| `tools.py` | `Tool` 和 `@tool`。参数 Schema 由 pydantic 生成；输出默认截断到 8000 字；任何异常都变成 `ERROR: …` 回灌，不让循环崩 |
+| `tools.py` | `Tool` 和 `@tool`。参数 Schema 由 pydantic 生成；输出默认截断到 8000 字；任何异常都变成 `ERROR: …` 回灌，不让循环崩；`tags` 里的 `side_effect`（`SIDE_EFFECT_TAG`）标记有外部副作用的工具 |
 | `agent.py` | `AgentSpec` |
 | `loop.py` | `run_agent`，见下 |
-| `context.py` | `RunContext`：租户、模型、工作区、沙箱、追踪、业务依赖 `deps`、测试替身 `chat_clients` |
+| `context.py` | `RunContext`：租户、模型、工作区、沙箱、追踪、业务依赖 `deps`、测试替身 `chat_clients`、复现标记 `replay` |
 | `skills.py` | 扫描 `skills_dir/*/SKILL.md`，提示词里只放一行索引，自动加 `read_skill` 工具 |
 | `sandbox.py` | `SandboxExecutor` 接口和 `BwrapSandbox`（断网、清空环境变量、只挂显式目录、超时杀进程） |
 | `workspace.py` | `Workspace`（路径不越界、`.git` 不可见、原子写）和 `workspace_tools()` 工厂 |
@@ -82,6 +82,7 @@ TraceStore(Path("/data/telemetry")).save(ctx.trace)   # 落盘完整轨迹
 
 护栏：
 - 同一工具 + 同样参数连续执行超过 `AgentSpec.max_identical_tool_calls`（默认 2）次，第三次起不执行，直接回灌“已拦截”。
+- `ctx.replay=True`（复现运行）时，带 `side_effect` 标签的工具不执行，回灌“回放运行已拦截”，tool span 记 `blocked` 与 `replay_blocked`。读库、读写工作区这类可在隔离租户里安全重做的工具不要打这个标签。
 - 每次模型调用后检查 `trace.budget`（`max_cost` / `max_tokens`，按整条轨迹累计），超出抛 `BudgetExceeded`，不回灌给模型。
 
 ## 轨迹与可观测性
@@ -103,6 +104,8 @@ TraceStore(Path("/data/telemetry")).save(ctx.trace)   # 落盘完整轨迹
 - `traces/YYYY/MM/DD/<trace_id>.json.zst`、`index/YYYY-MM.runs.jsonl`、`blobs/sha256/<2位>/<hash>.zst`，目录 0700、文件 0600，原子写。
 - 超过阈值的字符串、以及资产原文外置为 `{"$ref": "sha256:…", "chars": N}`；`load(id, hydrate=True)` 还原。
 - `redact` 在落盘与导出前作用于整份 JSON；导出失败只打 stderr，不影响落盘。
+- 索引行除用量、成本、指纹外，还带根 span 属性里的 `env_digest`、`env_watermark`（业务层的执行环境锚点摘要），列表与统计不用解压轨迹。
+- `purge(predicate, dry_run=False, blob_grace_seconds=3600)`：按索引行条件删轨迹，索引文件持排他锁原地重写（追加也持同一把锁，不会丢行），再对 blobs 做标记-清扫；只删无人引用且超过宽限期的 blob，避开并发落盘时“blob 已写、轨迹未写”的窗口。
 
 `OtlpExporter(endpoint, headers=..., project=...)` 直接拼 protobuf，保留原 trace_id/span_id/时间戳，所以实时导出和事后回放得到同一棵树。成本以 `agentkit.cost_cny` 导出，不冒充 `llm.cost`（美元）；token 只写在 LLM span 上，避免后端重复累计。
 
@@ -125,4 +128,4 @@ TraceStore(Path("/data/telemetry")).save(ctx.trace)   # 落盘完整轨迹
 cd code && .venv/bin/pytest -q
 ```
 
-`tests/test_agentkit_*.py` 覆盖工具回灌、工具报错不崩、输出修复、轮数收敛、路径越界、只读沙箱、技能加载，以及连真实库的租户上下文和咨询锁（没有 `config/db.env` 时跳过）。`test_agentkit_trace.py` 覆盖 span 树、原文不截断、成本、指纹、重复调用拦截、预算、落盘/外置/脱敏/权限、summary 级别和 OTLP 属性。
+`tests/test_agentkit_*.py` 覆盖工具回灌、工具报错不崩、输出修复、轮数收敛、路径越界、只读沙箱、技能加载，以及连真实库的租户上下文和咨询锁（没有 `config/db.env` 时跳过）。`test_agentkit_trace.py` 覆盖 span 树、原文不截断、成本、指纹、重复调用拦截、预算、落盘/外置/脱敏/权限、summary 级别和 OTLP 属性。`test_staged_dream_and_replay.py` 覆盖回放拦截 `side_effect` 工具、`purge` 删轨迹与 blob 回收（以及业务层的暂存整理和复现前置）。

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from agentkit.context import RunContext
 
 DEFAULT_MAX_OUTPUT_CHARS = 8000
+SIDE_EFFECT_TAG = "side_effect"
 
 Handler = Callable[[Any, "RunContext"], Awaitable[Any] | Any]
 

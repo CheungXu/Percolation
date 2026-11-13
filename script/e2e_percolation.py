@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""端到端真机验收。用 owner 账号建一个临时测试租户，跑完 4 个场景后清理。
+"""端到端真机验收。用 owner 账号建一个临时测试租户，跑完 7 个场景后清理。
 
   code/.venv/bin/python script/e2e_percolation.py [--keep]
 
 场景：
 1. 连发录入后，未整理就能直接查到（pending 原话轨道）。
 2. 增量整理生成主题页、向量、链接、git 提交。
-3. 候选区暗语被沙箱探查命中 2 次，下一次整理晋升进热区，之后走主路径直达。
-4. 未知指代追问 → 用户澄清 → 固化；热区不含推测；跨租户互相不可见。
+3. 人工编辑候选区经 reindex 发布；暗语被沙箱探查命中 2 次，下一次整理晋升进热区，之后走主路径直达。
+4. 未知指代追问 → 用户澄清 → 固化；热区不含推测。
+5. 多维正交归档与检索、拓扑图；跨租户互相不可见。
+6. 整理期间并发检索只看已发布版本；发布事务失败时主工作区与派生表不变。
+7. 按执行环境锚点复现候选区兜底检索、维度检索与整理，各重跑 2 次并对比。
 
 模型输出有随机性，脚本逐项打印 PASS/FAIL，不在第一处失败时中止。
 """
@@ -17,7 +20,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -25,11 +27,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 
 from agentkit.envfile import load_env_file  # noqa: E402
-from agentkit.tenancy import create_pool  # noqa: E402
-from percolation import graph  # noqa: E402
+from percolation import graph, replay, tenants  # noqa: E402
 from percolation.agents import dream, search  # noqa: E402
 from percolation.capture import capture  # noqa: E402
-from percolation.memory_fs import MEMORY_FILE  # noqa: E402
+from percolation.memory_fs import MEMORY_FILE, changed_files, git_head  # noqa: E402
 from percolation.services import Services  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,36 +46,10 @@ def show(label: str, value: object) -> None:
     print(f"--- {label}\n{json.dumps(value, ensure_ascii=False, indent=2, default=str)[:3000]}", flush=True)
 
 
-async def create_tenant(owner_url: str, slug: str) -> None:
-    pool = await create_pool(owner_url, max_size=1)
-    try:
-        async with pool.connection() as conn:
-            await conn.execute("INSERT INTO users (external_slug) VALUES (%s)", (slug,))
-    finally:
-        await pool.close()
-
-
 async def drop_tenant(owner_url: str, slug: str, nas_root: Path) -> None:
-    pool = await create_pool(owner_url, max_size=1)
-    try:
-        async with pool.connection() as conn:
-            row = await (await conn.execute("SELECT id::text AS id, workspace_rel_path FROM users WHERE external_slug = %s", (slug,))).fetchone()
-            if row is None:
-                return
-            async with conn.transaction():
-                await conn.execute("ALTER TABLE raw_messages DISABLE TRIGGER raw_messages_guard")
-                await conn.execute("DELETE FROM raw_messages WHERE user_id = %s", (row["id"],))
-                await conn.execute("ALTER TABLE raw_messages ENABLE TRIGGER raw_messages_guard")
-                await conn.execute("DELETE FROM users WHERE id = %s", (row["id"],))
-        workspace = nas_root / row["workspace_rel_path"]
-        if workspace.is_dir() and row["id"] in workspace.name:
-            shutil.rmtree(workspace)
-        traces = ROOT / "data" / "traces" / row["id"]
-        if traces.is_dir():
-            shutil.rmtree(traces)
-        print(f"已清理测试租户 {slug}（{row['id']}）")
-    finally:
-        await pool.close()
+    user_id = await tenants.drop_tenant(owner_url, slug, nas_root)
+    if user_id:
+        print(f"已清理测试租户 {slug}（{user_id}）；轨迹保留，需要时 trace_cli.py purge --tenant {user_id}")
 
 
 async def scenarios(services: Services, slug: str) -> None:
@@ -110,11 +85,15 @@ async def scenarios(services: Services, slug: str) -> None:
         existing.rstrip("\n")
         + f"\n- 雕牌屏：技嘉 AORUS FO27Q3 显示器（雕是技嘉 AORUS 的鹰标）[confirmed] [#msg_{m3['msg_seq']}]\n",
     )
+    await dream.reindex(services, user)
+    check("人工编辑经 reindex 提交发布", not changed_files(ws), changed_files(ws))
     routes = []
+    cache_traces = []
     for attempt in range(2):
         r = await search.ask(services, user, "雕牌屏现在什么价来着")
         show(f"ask 雕牌屏 {attempt + 1}", r.as_dict())
         routes.append(r.route_path)
+        cache_traces.append(r.trace_id)
         check(f"第 {attempt + 1} 次经候选区答出 4299", r.route_path == "cache_fallback" and r.outcome == "answered" and "4299" in r.answer, f"{r.route_path} {r.answer}")
     d = await dream.run_for_user(services, user)
     show("dream 2", d.as_dict())
@@ -219,6 +198,100 @@ async def scenarios(services: Services, slug: str) -> None:
         bare_pages = await (await conn.execute("SELECT count(*) AS n FROM wiki_pages")).fetchone()
     check("不设租户时一行也看不到", bare["n"] == 0 and bare_pages["n"] == 0, f"{bare['n']} {bare_pages['n']}")
 
+    await scenario_concurrency(services, user, ws)
+    await scenario_reproduce(services, cache_traces[0], r_domain.trace_id, d_multi.trace_id)
+
+
+async def derived_snapshot(services: Services, user) -> dict[str, int]:
+    async with services.tx(user) as conn:
+        return {
+            table: (await (await conn.execute(f"SELECT count(*) AS n FROM {table}")).fetchone())["n"]
+            for table in ("wiki_pages", "page_facets", "message_facets", "message_events", "wiki_chunks", "wiki_links")
+        } | {
+            "content": (await (await conn.execute("SELECT md5(string_agg(content_hash, ',' ORDER BY doc_path, chunk_index)) AS h FROM wiki_chunks")).fetchone())["h"]
+        }
+
+
+async def scenario_concurrency(services: Services, user, ws) -> None:
+    print("\n===== 场景 6：整理期间检索只看已发布版本；发布前失败主工作区与索引不变")
+    head_before = git_head(ws)
+    m_new = await capture(services, user, "周三晚上和老王约了羽毛球，奥体中心 3 号场")
+    task = asyncio.create_task(dream.run_for_user(services, user))
+    staging_root = services.settings.nas_root / "staging" / user.id
+    for _ in range(120):
+        if task.done() or (staging_root.is_dir() and any(staging_root.iterdir())):
+            break
+        await asyncio.sleep(0.5)
+    during = await search.ask(services, user, "我之前收藏过什么网站？")
+    trace = services.trace_store.load(during.trace_id)
+    env = next(s for s in trace["spans"] if s["parent_id"] is None)["attributes"]["env"]
+    overlapped = not task.done()
+    check(
+        "整理进行中检索：主工作区未动、锚点版本与已发布一致",
+        overlapped and git_head(ws) == head_before and env["workspace"]["git_head"] == head_before
+        and env["workspace"]["workspace_mismatch"] is False and during.outcome == "answered",
+        {"overlapped": overlapped, "env_ws": env["workspace"], "outcome": during.outcome},
+    )
+    d = await task
+    async with services.tx(user) as conn:
+        state = await (await conn.execute("SELECT workspace_head FROM users WHERE id = %s", (user.id,))).fetchone()
+    check(
+        "发布后主工作区快进且 workspace_head 一致",
+        d.status == "succeeded" and m_new["msg_seq"] in d.archived and git_head(ws) == state["workspace_head"] != head_before
+        and not changed_files(ws),
+        {"status": d.status, "archived": d.archived, "head": git_head(ws), "db": state["workspace_head"]},
+    )
+
+    m_fail = await capture(services, user, "下个月想去杭州看一次秋天的西湖")
+    head_mid = git_head(ws)
+    before = await derived_snapshot(services, user)
+    original_finalize = dream._finalize
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("e2e 注入：发布事务失败")
+
+    dream._finalize = boom
+    try:
+        failed = await dream.run_for_user(services, user)
+    finally:
+        dream._finalize = original_finalize
+    after = await derived_snapshot(services, user)
+    async with services.tx(user) as conn:
+        status = (await (await conn.execute("SELECT dream_status FROM raw_messages WHERE msg_seq = %s", (m_fail["msg_seq"],))).fetchone())["dream_status"]
+    check(
+        "发布前失败：主工作区、六张派生表、原话状态均不变",
+        failed.status == "failed" and git_head(ws) == head_mid and not changed_files(ws) and before == after and status == "pending"
+        and not any(staging_root.iterdir()),
+        {"status": failed.status, "error": failed.error, "before": before, "after": after, "raw": status},
+    )
+
+
+async def scenario_reproduce(services: Services, cache_trace: str, facet_trace: str, dream_trace: str) -> None:
+    print("\n===== 场景 7：按执行环境锚点复现（候选区兜底检索、维度检索、整理各 2 次）")
+    for label, trace_id in (("候选区兜底检索", cache_trace), ("维度检索", facet_trace), ("整理", dream_trace)):
+        report = await replay.reproduce(services, trace_id, runs=2)
+        runs = report["runs"]
+        show(f"reproduce {label}", {k: v for k, v in report.items() if k != "runs"} | {"runs": [{k: r[k] for k in ("same", "watermark_match", "setup")} for r in runs]})
+        watermark_ok = all(all(r["watermark_match"].values()) for r in runs)
+        check(f"复现{label}：两次重跑水位与原锚点一致、环境无差异", len(runs) == 2 and watermark_ok and not report["env_diff"], report["env_diff"])
+        if report["name"] == "search":
+            hits = sum(r["same"]["outcome"] and r["same"]["route_path"] for r in runs)
+            check(f"复现{label}：至少一次结果与路由与原运行一致", hits >= 1, [r["summary"]["answer"][:80] for r in runs])
+        else:
+            same = sum(r["same"]["status"] and r["same"]["mode"] and r["same"]["archived"] for r in runs)
+            check(f"复现{label}：两次重跑模式与归档集合都与原运行一致", same == 2, [r["summary"] for r in runs])
+    owner_url = load_env_file(ROOT / "config" / "db.env")["MIGRATE_DATABASE_URL"]
+    from agentkit.tenancy import create_pool
+
+    pool = await create_pool(owner_url, max_size=1)
+    try:
+        async with pool.connection() as conn:
+            left = (await (await conn.execute("SELECT count(*) AS n FROM users WHERE external_slug LIKE 'replay-%%'")).fetchone())["n"]
+    finally:
+        await pool.close()
+    replays = [row for row in services.trace_store.iter_index() if row["metadata"].get("replay_of") in {cache_trace, facet_trace, dream_trace}]
+    check("复现结束：replay 租户已清理，回放轨迹带 replay_of 保留", left == 0 and len(replays) >= 6, {"left": left, "replay_traces": len(replays)})
+
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
@@ -227,8 +300,8 @@ async def main() -> None:
     args = parser.parse_args()
     owner_url = load_env_file(ROOT / "config" / "db.env")["MIGRATE_DATABASE_URL"]
     if args.drop:
-        if not args.drop.startswith("e2e-"):
-            raise SystemExit("只能清理 e2e- 开头的测试租户")
+        if not tenants.is_disposable(args.drop):
+            raise SystemExit("只能清理 e2e- / replay- 开头的临时租户")
         nas_root = Path(load_env_file(ROOT / "config" / "storage.env").get("NAS_ROOT_DIR", "/mnt/percolation"))
         await drop_tenant(owner_url, args.drop, nas_root)
         return
@@ -236,7 +309,7 @@ async def main() -> None:
     services = await Services.open()
     started = time.monotonic()
     try:
-        await create_tenant(owner_url, slug)
+        await tenants.create_tenant(owner_url, slug)
         print(f"测试租户：{slug}")
         await scenarios(services, slug)
     finally:

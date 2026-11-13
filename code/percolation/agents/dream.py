@@ -1,12 +1,15 @@
 """Dreaming Agent：夜间自底向上整理。
 
-0. 从脏队列取租户，加单租户咨询锁，判定节奏（incremental / defrag），登记 dream_runs。
-1. 归档：dream_model 把 pending 原话按连发批次并入主题页和候选区。
-2. 索引：确定性同步 wiki_chunks / wiki_links。
+0. 从脏队列取租户，加单租户咨询锁；补齐上次中断的发布、把人工改动先提交发布；
+   记执行环境锚点（工作区版本、库水位、代码与配置指纹），判定节奏（incremental / defrag），登记 dream_runs。
+1. 在暂存 worktree（staging/<uid>/<run_id>）里写：dream_model 把 pending 原话按连发批次并入主题页和候选区。
+2. 索引计划：解析暂存文件、算新切片向量，不写库。
 3. 升降级：按候选区命中统计晋升热区，热区超水位或 defrag 时下沉、合并、修链。
-4. 收尾：单事务推进原话状态、清脏标记、记账；工作区 git 提交。
+4. 发布：暂存分支提交 → 单事务刷新六张派生表 + 推进原话状态 + 记 users.workspace_head → 主工作区快进。
 
-任一步失败：丢弃未提交的文件改动、按文件重建索引、记 failed，原话保持 pending 下次重试。
+发布事务之前任一步失败：整个暂存区丢弃，主工作区与索引从未被碰过，原话保持 pending 下次重试。
+事务已提交但快进失败：保留暂存分支，下次整理开头按 workspace_head 补快进。
+检索全程只读主工作区和已发布索引，看不到半成品。
 """
 
 from __future__ import annotations
@@ -14,24 +17,33 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from functools import cache
 
 from pydantic import BaseModel, Field
 
 from agentkit import AgentSpec, Trace, run_agent
 from agentkit.tenancy import try_advisory_lock
-from percolation import retriever
+from agentkit.workspace import Workspace
+from percolation import env_anchor, retriever
 from percolation.agents import SKILLS_DIR, load_prompt
-from percolation.indexer import load_pages, sync_wiki
+from percolation.indexer import SyncPlan, SyncReport, apply_sync, load_pages, plan_sync
 from percolation.memory_fs import (
     CACHE_DIR,
     MEMORY_FILE,
     WIKI_DIR,
     changed_files,
+    clear_stale_lock,
+    create_staging,
+    ensure_published,
+    fast_forward,
+    gc_auto,
     git_commit,
-    git_discard,
+    git_head,
     line_count,
+    prune_merged_staging_branches,
+    remove_staging,
+    staging_branch,
 )
 from percolation.services import Services, UserRef
 from percolation.tools import FETCH_RAW, HYBRID_SEARCH, memory_write_tools
@@ -43,6 +55,12 @@ PROMOTION_MIN_HITS = 2
 DEFRAG_INTERVAL_DAYS = 7
 DEFRAG_DANGLING_LINKS = 5
 ENTRY_KEY_RE = re.compile(r"^\s*[-*]\s*([^:：\n]+?)\s*[:：]")
+DREAM_LOCK = "percolation:dream:{user_id}"
+
+
+def dream_lock_key(user: UserRef) -> str:
+    """整理与 reindex 共用：同一租户的工作区和派生表同一时间只有一个写者。"""
+    return DREAM_LOCK.format(user_id=user.id)
 
 
 def extract_entry_keys(text: str) -> set[str]:
@@ -209,23 +227,21 @@ async def _catalog_with_existing_facets(services: Services, user: UserRef, ws) -
     return catalog
 
 
-async def _facet_distribution_lines(services: Services, user: UserRef) -> list[str]:
-    async with services.tx(user) as conn:
-        rows = await (
-            await conn.execute(
-                """
-                SELECT dim, val, count(DISTINCT doc_path)::int AS pages
-                FROM page_facets GROUP BY dim, val ORDER BY dim, pages DESC, val
-                """
-            )
-        ).fetchall()
+def facet_distribution_lines(pages) -> list[str]:
+    """按暂存区文件统计维度分布：重整看到的是本次归档之后的真实分布，而不是上次发布的索引。"""
+    counts: dict[tuple[str, str], int] = {}
+    for page in pages:
+        for dim, vals in page.facets.items():
+            for val in dict.fromkeys(vals):
+                counts[(dim, val)] = counts.get((dim, val), 0) + 1
+    ordered = sorted(counts.items(), key=lambda item: (item[0][0], -item[1], item[0][1]))
     return [
-        f"- {r['dim']}={r['val']} · {r['pages']} 页" + ("（孤立单页标签）" if r["pages"] == 1 else "")
-        for r in rows
+        f"- {dim}={val} · {n} 页" + ("（孤立单页标签）" if n == 1 else "")
+        for (dim, val), n in ordered
     ]
 
 
-async def _cache_hit_stats(services: Services, user: UserRef) -> list[dict]:
+async def _cache_hit_stats(services: Services, user: UserRef, as_of: datetime) -> list[dict]:
     async with services.tx(user) as conn:
         rows = await (
             await conn.execute(
@@ -237,62 +253,89 @@ async def _cache_hit_stats(services: Services, user: UserRef) -> list[dict]:
                        max(hit->>'clue') AS clue, count(*) AS hits, max(s.created_at) AS last_hit
                 FROM search_logs s, jsonb_array_elements(s.cache_hit_entries) AS hit
                 WHERE s.route_path = 'cache_fallback' AND s.outcome = 'answered'
-                  AND s.created_at >= now() - %s::interval
+                  AND s.created_at >= %(as_of)s::timestamptz - %(window)s::interval
+                  AND s.created_at <= %(as_of)s::timestamptz
                 GROUP BY 2 ORDER BY hits DESC, last_hit DESC
                 """,
-                (timedelta(days=PROMOTION_WINDOW_DAYS),),
+                {"as_of": as_of, "window": timedelta(days=PROMOTION_WINDOW_DAYS)},
             )
         ).fetchall()
     return [dict(row) for row in rows]
 
 
-async def _memory_clue_usage(services: Services, user: UserRef) -> list[dict]:
+async def _memory_clue_usage(services: Services, user: UserRef, as_of: datetime) -> list[dict]:
     async with services.tx(user) as conn:
         rows = await (
             await conn.execute(
                 """
                 SELECT clue, count(*) AS uses, max(created_at) AS last_used
                 FROM search_logs, unnest(memory_clues_used) AS clue
-                WHERE created_at >= now() - interval '30 days'
+                WHERE created_at >= %(as_of)s::timestamptz - interval '30 days'
+                  AND created_at <= %(as_of)s::timestamptz
                 GROUP BY 1 ORDER BY uses DESC LIMIT 100
-                """
+                """,
+                {"as_of": as_of},
             )
         ).fetchall()
     return [dict(row) for row in rows]
 
 
-def choose_mode(state: dict, memory_lines: int, soft_limit: int, dangling: int, requested: str | None) -> str:
+def decide_mode(
+    state: dict,
+    memory_lines: int,
+    soft_limit: int,
+    dangling: int,
+    requested: str | None,
+    *,
+    as_of: datetime,
+) -> tuple[str, list[str]]:
+    """返回 (模式, 理由)。时间判断一律用 as_of，复现时注入原运行的时刻即可得到相同判定。"""
     if requested in {"incremental", "defrag"}:
-        return requested
+        return requested, [f"requested:{requested}"]
+    reasons = []
+    if memory_lines > soft_limit:
+        reasons.append(f"memory_lines:{memory_lines}>{soft_limit}")
+    if dangling >= DEFRAG_DANGLING_LINKS:
+        reasons.append(f"dangling:{dangling}>={DEFRAG_DANGLING_LINKS}")
     reference = state["last_defrag_at"] or state["created_at"]
-    if memory_lines > soft_limit or dangling >= DEFRAG_DANGLING_LINKS:
-        return "defrag"
-    if reference and datetime.now(UTC) - reference >= timedelta(days=DEFRAG_INTERVAL_DAYS):
-        return "defrag"
-    return "incremental"
+    if reference and as_of - reference >= timedelta(days=DEFRAG_INTERVAL_DAYS):
+        reasons.append(f"interval:{(as_of - reference).days}d>={DEFRAG_INTERVAL_DAYS}d")
+    return ("defrag" if reasons else "incremental"), reasons
 
 
-async def _traced_sync(services: Services, user: UserRef, ws, trace: Trace):
-    """索引同步包一层 span：embedding 用量和改动的文档都记在上面。"""
-    with trace.span("sync_wiki", kind="chain") as span:
-        report = await sync_wiki(services, user, ws)
-        span.set(**report.as_dict())
-    return report
+def choose_mode(
+    state: dict, memory_lines: int, soft_limit: int, dangling: int, requested: str | None, *, as_of: datetime
+) -> str:
+    return decide_mode(state, memory_lines, soft_limit, dangling, requested, as_of=as_of)[0]
 
 
-async def run_for_user(services: Services, user: UserRef, *, mode: str | None = None) -> DreamOutcome:
-    async with try_advisory_lock(services.pool, f"percolation:dream:{user.id}") as acquired:
+async def _traced_plan(
+    services: Services, user: UserRef, ws: Workspace, trace: Trace, vector_cache: dict[str, str], name: str
+) -> SyncPlan:
+    """索引计划包一层 span：embedding 用量与预览（页数、悬空链接）记在上面。"""
+    with trace.span(name, kind="chain") as span:
+        plan = await plan_sync(services, user, ws, vector_cache)
+        span.set(**plan.preview())
+    return plan
+
+
+async def run_for_user(
+    services: Services, user: UserRef, *, mode: str | None = None, as_of: datetime | None = None
+) -> DreamOutcome:
+    async with try_advisory_lock(services.pool, dream_lock_key(user)) as acquired:
         if not acquired:
             return DreamOutcome(user_id=user.id, status="locked")
-        return await _run_locked(services, user, mode)
+        return await _run_locked(services, user, mode, as_of)
 
 
-async def _run_locked(services: Services, user: UserRef, requested_mode: str | None) -> DreamOutcome:
+async def _run_locked(
+    services: Services, user: UserRef, requested_mode: str | None, as_of: datetime | None = None
+) -> DreamOutcome:
     trace = services.new_trace("dream", user, requested_mode=requested_mode)
-    trace.root.payload["input"] = {"requested_mode": requested_mode}
+    trace.root.payload["input"] = {"requested_mode": requested_mode, "as_of": as_of.isoformat() if as_of else None}
     try:
         with trace.activate():
-            outcome = await _dream(services, user, trace, requested_mode)
+            outcome = await _dream(services, user, trace, requested_mode, as_of)
     except Exception as exc:
         error = f"{type(exc).__name__}: {services.models.redact(str(exc))}"[:2000]
         services.save_trace(user, trace, {"error": error}, status="failed")
@@ -306,11 +349,82 @@ async def _run_locked(services: Services, user: UserRef, requested_mode: str | N
     return outcome
 
 
-async def _dream(services: Services, user: UserRef, trace: Trace, requested_mode: str | None) -> DreamOutcome:
+async def prepare_workspace(
+    services: Services, user: UserRef, trace: Trace | None = None
+) -> tuple[Workspace, SyncReport | None]:
+    """持整理锁时调用：清残留 index.lock、补齐中断的快进、把人工改动提交并发布索引。
+
+    之后主工作区满足三条不变式：工作树干净、HEAD == users.workspace_head、派生表与 HEAD 一致。
+    返回主工作区，以及这一步做了索引同步时的报告。
+    """
+    main = services.workspace(user)
+    notes: dict = {}
+    report = None
+    if clear_stale_lock(main):
+        notes["stale_lock_cleared"] = True
+    async with services.tx(user) as conn:
+        row = await (await conn.execute("SELECT workspace_head FROM users WHERE id = %s", (user.id,))).fetchone()
+    published = row["workspace_head"] if row else None
+    if ensure_published(main, published):
+        notes["fast_forward_repaired"] = published
+    pruned = prune_merged_staging_branches(main)
+    if pruned:
+        notes["pruned_branches"] = pruned
+    external = git_commit(main, "external edits") if changed_files(main) else None
+    head = git_head(main)
+    if external or head != published:
+        plan = await plan_sync(services, user, main)
+        async with services.tx(user) as conn:
+            report = await apply_sync(conn, user, plan)
+            await conn.execute("UPDATE users SET workspace_head = %s WHERE id = %s", (head, user.id))
+        notes.update(external_commit=external, published_head=head, docs_rewritten=report.docs_rewritten)
+    if notes and trace is not None:
+        trace.event("workspace_prepared", **notes)
+    return main, report
+
+
+async def repair_fast_forward(services: Services, user: UserRef) -> bool:
+    """给检索用：发现主工作区落后于已发布版本时，拿得到整理锁就补快进，拿不到就跳过。
+
+    只做快进，不做索引同步；工作区领先（人工改动）仍留给整理或 reindex 处理。
+    """
+    async with try_advisory_lock(services.pool, dream_lock_key(user)) as acquired:
+        if not acquired:
+            return False
+        main = services.workspace(user)
+        async with services.tx(user) as conn:
+            row = await (await conn.execute("SELECT workspace_head FROM users WHERE id = %s", (user.id,))).fetchone()
+        repaired = ensure_published(main, row["workspace_head"] if row else None)
+        if repaired:
+            prune_merged_staging_branches(main)
+        return repaired
+
+
+async def reindex(services: Services, user: UserRef) -> SyncReport | None:
+    """按主工作区文件重建全部派生表。与整理共用一把锁；拿不到锁返回 None。"""
+    async with try_advisory_lock(services.pool, dream_lock_key(user)) as acquired:
+        if not acquired:
+            return None
+        main, report = await prepare_workspace(services, user)
+        if report is None:
+            plan = await plan_sync(services, user, main)
+            async with services.tx(user) as conn:
+                report = await apply_sync(conn, user, plan)
+        gc_auto(main)
+        return report
+
+
+async def _dream(
+    services: Services, user: UserRef, trace: Trace, requested_mode: str | None, as_of_override: datetime | None = None
+) -> DreamOutcome:
     settings = services.settings
-    ws = services.workspace(user)
-    ctx = services.context(user, trace, ws)
+    main, _ = await prepare_workspace(services, user, trace)
     memory_limit, soft_limit = settings.memory_line_limit, settings.memory_soft_limit
+
+    anchor = await services.capture_env(user, main, as_of=as_of_override, check_clean=True)
+    env_anchor.attach(trace, anchor)
+    as_of = datetime.fromisoformat(anchor["db"]["as_of"])
+    max_msg_seq = anchor["db"]["max_msg_seq"]
 
     async with services.tx(user) as conn:
         state = await (await conn.execute("SELECT * FROM users WHERE id = %s", (user.id,))).fetchone()
@@ -322,27 +436,38 @@ async def _dream(services: Services, user: UserRef, trace: Trace, requested_mode
                     SELECT r.msg_seq, r.batch_id::text AS batch_id, r.source_kind, r.content, r.captured_at,
                            r.dream_status, s.query_text AS reply_to_query
                     FROM raw_messages r LEFT JOIN search_logs s ON s.id = r.reply_to_search_id
-                    WHERE r.dream_status = 'pending' ORDER BY r.msg_seq LIMIT 400
-                    """
+                    WHERE r.dream_status = 'pending' AND r.msg_seq <= %s ORDER BY r.msg_seq LIMIT 400
+                    """,
+                    (max_msg_seq,),
                 )
             ).fetchall()
         ]
         dangling = (await (await conn.execute("SELECT count(*) AS n FROM wiki_links WHERE to_doc_path IS NULL")).fetchone())["n"]
-    memory_init = ws.read_text(MEMORY_FILE)
+    memory_init = main.read_text(MEMORY_FILE)
     memory_lines = line_count(memory_init)
-    mode = choose_mode(state, memory_lines, soft_limit, dangling, requested_mode)
-    hit_stats = await _cache_hit_stats(services, user)
+    mode, reasons = decide_mode(state, memory_lines, soft_limit, dangling, requested_mode, as_of=as_of)
+    hit_stats = await _cache_hit_stats(services, user, as_of)
     cache_texts = [
         p.read_text(encoding="utf-8", errors="replace")
-        for p in ws.files(CACHE_DIR, "**/*.md")
+        for p in main.files(CACHE_DIR, "**/*.md")
         if p.name != "facets.md"
     ]
     promotable = filter_promotable_stats(hit_stats, memory_init, cache_texts)
     candidates = [stat for stat in promotable if stat["hits"] >= PROMOTION_MIN_HITS]
     needs_tiering = bool(candidates) or memory_lines > soft_limit or mode == "defrag"
+    env_anchor.set_decision(
+        trace,
+        mode=mode,
+        reasons=reasons,
+        pending=[row["msg_seq"] for row in pending],
+        candidates=[{"entry_key": s["entry_key"], "hits": s["hits"]} for s in candidates],
+        memory_lines=memory_lines,
+        dangling=dangling,
+    )
 
     if not pending and not needs_tiering:
-        await _finalize(services, user, None, mode, [], [], memory_lines, ArchiveReport(), TieringReport(), [], trace, defrag=False)
+        async with services.tx(user) as conn:
+            await _finalize(conn, user, None, mode, [], [], memory_lines, ArchiveReport(), TieringReport(), [], trace, defrag=False)
         return DreamOutcome(user_id=user.id, status="noop", mode=mode)
 
     seqs = [row["msg_seq"] for row in pending]
@@ -359,7 +484,14 @@ async def _dream(services: Services, user: UserRef, trace: Trace, requested_mode
     run_id = run["id"]
     trace.event("dream_start", run_id=run_id, mode=mode, pending=len(pending), candidates=len(candidates))
 
+    branch = staging_branch(run_id)
+    staging_path = settings.nas_root / "staging" / user.id / run_id
+    published = False
+    keep_branch = False
     try:
+        ws = create_staging(main, staging_path, branch)
+        ctx = services.context(user, trace, ws)
+        vector_cache: dict[str, str] = {}
         archive = ArchiveReport()
         memory = memory_init
         catalog = await _catalog_with_existing_facets(services, user, ws)
@@ -367,7 +499,7 @@ async def _dream(services: Services, user: UserRef, trace: Trace, requested_mode
         for group in _batches(pending, ARCHIVE_BATCH_MESSAGES):
             prompt = "\n\n".join(
                 [
-                    _section("当前日期", retriever.format_local_today()),
+                    _section("当前日期", retriever.format_local_today(as_of)),
                     _section("受控维度词表", taxonomy_text),
                     _section("热区记忆 MEMORY.md", memory),
                     _section("现有主题页", _wiki_index_text(ws)),
@@ -380,7 +512,8 @@ async def _dream(services: Services, user: UserRef, trace: Trace, requested_mode
             archive.skipped_msg_seqs += report.skipped_msg_seqs
             archive.notes = "\n".join(filter(None, [archive.notes, report.notes]))
 
-        index_report = await _traced_sync(services, user, ws, trace)
+        plan = await _traced_plan(services, user, ws, trace, vector_cache, "plan_sync")
+        embedded = plan.embedded
 
         # 归档后重新计算仍在候选区且尚未进热区的有效晋升项
         memory_text = ws.read_text(MEMORY_FILE)
@@ -402,7 +535,10 @@ async def _dream(services: Services, user: UserRef, trace: Trace, requested_mode
                 + (f" · 线索：{s['clue']}" if s.get("clue") else "")
                 for s in post_promotable
             ]
-            usage_lines = [f"- {u['clue']} · 用到 {u['uses']} 次 · 最近 {u['last_used']:%m-%d}" for u in await _memory_clue_usage(services, user)]
+            usage_lines = [
+                f"- {u['clue']} · 用到 {u['uses']} 次 · 最近 {u['last_used']:%m-%d}"
+                for u in await _memory_clue_usage(services, user, as_of)
+            ]
             parts = [
                 _section("模式", mode),
                 _section(f"热区 MEMORY.md 当前内容（{line_count(memory_text)} 行，上限 {memory_limit}）", memory_text),
@@ -411,18 +547,17 @@ async def _dream(services: Services, user: UserRef, trace: Trace, requested_mode
                 _section("候选缓存区文件", "\n".join(ws.rel(p) for p in ws.files(CACHE_DIR, "**/*.md"))),
             ]
             if defrag:
-                facet_lines = await _facet_distribution_lines(services, user)
+                staged_pages, _ = load_pages(ws)
                 parts.append(_section("受控维度词表", taxonomy_text))
                 parts.append(_section("现有主题页", _wiki_index_text(ws)))
-                parts.append(_section("当前维度分布（注意合并只出现 1 次的近义标签）", "\n".join(facet_lines)))
-                parts.append(_section("悬空链接", "\n".join(index_report.dangling)))
+                parts.append(
+                    _section("当前维度分布（注意合并只出现 1 次的近义标签）", "\n".join(facet_distribution_lines(staged_pages)))
+                )
+                parts.append(_section("悬空链接", "\n".join(plan.dangling)))
             tiering = (await run_agent(tiering_spec(memory_limit, soft_limit, defrag), "\n\n".join(parts), ctx)).output
-            if any(path.startswith(f"{WIKI_DIR}/") for path in changed_files(ws)):
-                second = await _traced_sync(services, user, ws, trace)
-                second.embedded += index_report.embedded
-                second.docs_rewritten = sorted({*index_report.docs_rewritten, *second.docs_rewritten})
-                second.docs_deleted = sorted({*index_report.docs_deleted, *second.docs_deleted})
-                index_report = second
+            if defrag:
+                plan = await _traced_plan(services, user, ws, trace, vector_cache, "plan_sync_after_tiering")
+                embedded += plan.embedded
 
         pending_set = set(seqs)
         anchored = _anchored_seqs(ws)
@@ -431,25 +566,41 @@ async def _dream(services: Services, user: UserRef, trace: Trace, requested_mode
         still_pending = sorted(pending_set - set(archived) - set(skipped))
         files = changed_files(ws)
         memory_lines = line_count(ws.read_text(MEMORY_FILE))
-        await _finalize(
-            services, user, run_id, mode, archived, skipped, memory_lines, archive, tiering, files, trace,
-            defrag=mode == "defrag",
-        )
         commit = git_commit(ws, f"dream {mode} {run_id[:8]}: archived {len(archived)}, skipped {len(skipped)}")
+        head = git_head(ws)
+
+        with trace.span("publish", kind="chain", workspace_head=head, commit=commit) as span:
+            async with services.tx(user) as conn:
+                index_report = await apply_sync(conn, user, plan)
+                index_report.embedded = embedded
+                await _finalize(
+                    conn, user, run_id, mode, archived, skipped, memory_lines, archive, tiering, files, trace,
+                    defrag=mode == "defrag", workspace_head=head,
+                )
+            # 事务已提交：在主工作区追上之前，暂存分支是新提交唯一的引用，不能删
+            published = True
+            keep_branch = True
+            ff_error = None
+            try:
+                if head != git_head(main):
+                    fast_forward(main, head)
+                keep_branch = False
+            except Exception as exc:  # noqa: BLE001
+                ff_error = f"主工作区快进失败，已保留分支 {branch}，下次整理或检索补齐：{services.models.redact(str(exc))}"[:500]
+                trace.event("publish_ff_failed", error=ff_error, branch=branch)
+            span.set(fast_forward_failed=ff_error is not None, **index_report.as_dict())
+        gc_auto(main)
         outcome = DreamOutcome(
             user_id=user.id, status="succeeded", mode=mode, run_id=run_id, archived=archived, skipped=skipped,
             still_pending=still_pending, files_changed=files,
             promotions=[m.model_dump() for m in tiering.promotions], demotions=[m.model_dump() for m in tiering.demotions],
-            index=index_report.as_dict(), commit=commit, usage=trace.usage.as_dict(),
+            index=index_report.as_dict(), commit=commit, error=ff_error, usage=trace.usage.as_dict(),
         )
     except Exception as exc:
+        if published:
+            raise
         error = f"{type(exc).__name__}: {services.models.redact(str(exc))}"[:2000]
         trace.event("dream_error", error=error)
-        git_discard(ws)
-        try:
-            await _traced_sync(services, user, ws, trace)
-        except Exception as sync_exc:  # noqa: BLE001
-            trace.event("dream_error", error=f"索引回滚失败：{sync_exc}"[:500])
         async with services.tx(user) as conn:
             await conn.execute(
                 """
@@ -459,11 +610,13 @@ async def _dream(services: Services, user: UserRef, trace: Trace, requested_mode
                 (error, json.dumps(trace.usage.as_dict()), run_id),
             )
         outcome = DreamOutcome(user_id=user.id, status="failed", mode=mode, run_id=run_id, error=error, usage=trace.usage.as_dict())
+    finally:
+        remove_staging(main, staging_path, branch, keep_branch=keep_branch)
     return outcome
 
 
 async def _finalize(
-    services: Services,
+    conn,
     user: UserRef,
     run_id: str | None,
     mode: str,
@@ -476,48 +629,50 @@ async def _finalize(
     trace: Trace,
     *,
     defrag: bool,
+    workspace_head: str | None = None,
 ) -> None:
-    async with services.tx(user) as conn:
-        await conn.execute("SELECT 1 FROM users WHERE id = %s FOR UPDATE", (user.id,))
-        if archived:
-            await conn.execute(
-                "UPDATE raw_messages SET dream_status = 'archived', dreamed_at = now() WHERE msg_seq = ANY(%s) AND dream_status = 'pending'",
-                (archived,),
-            )
-        if skipped:
-            await conn.execute(
-                "UPDATE raw_messages SET dream_status = 'skipped', dreamed_at = now() WHERE msg_seq = ANY(%s) AND dream_status = 'pending'",
-                (skipped,),
-            )
+    """在调用方的事务里推进原话状态与用户计数；workspace_head 给了就登记为新的已发布版本。"""
+    await conn.execute("SELECT 1 FROM users WHERE id = %s FOR UPDATE", (user.id,))
+    if archived:
+        await conn.execute(
+            "UPDATE raw_messages SET dream_status = 'archived', dreamed_at = now() WHERE msg_seq = ANY(%s) AND dream_status = 'pending'",
+            (archived,),
+        )
+    if skipped:
+        await conn.execute(
+            "UPDATE raw_messages SET dream_status = 'skipped', dreamed_at = now() WHERE msg_seq = ANY(%s) AND dream_status = 'pending'",
+            (skipped,),
+        )
+    await conn.execute(
+        """
+        UPDATE users SET
+          pending_msg_count = sub.n,
+          dirty_since = CASE WHEN sub.n > 0 THEN COALESCE(dirty_since, now()) ELSE NULL END,
+          pending_cache_hits = 0,
+          memory_line_count = %s,
+          last_dream_at = now(),
+          last_defrag_at = CASE WHEN %s THEN now() ELSE last_defrag_at END,
+          workspace_head = COALESCE(%s, workspace_head)
+        FROM (SELECT count(*)::int AS n FROM raw_messages WHERE dream_status = 'pending') sub
+        WHERE users.id = %s
+        """,
+        (memory_lines, defrag, workspace_head, user.id),
+    )
+    if run_id:
         await conn.execute(
             """
-            UPDATE users SET
-              pending_msg_count = sub.n,
-              dirty_since = CASE WHEN sub.n > 0 THEN COALESCE(dirty_since, now()) ELSE NULL END,
-              pending_cache_hits = 0,
-              memory_line_count = %s,
-              last_dream_at = now(),
-              last_defrag_at = CASE WHEN %s THEN now() ELSE last_defrag_at END
-            FROM (SELECT count(*)::int AS n FROM raw_messages WHERE dream_status = 'pending') sub
-            WHERE users.id = %s
+            UPDATE dream_runs SET status = 'succeeded', finished_at = now(), wiki_files_changed = %s,
+              cache_promotions = %s::jsonb, memory_demotions = %s::jsonb, token_usage = %s::jsonb
+            WHERE id = %s
             """,
-            (memory_lines, defrag, user.id),
+            (
+                files,
+                json.dumps([m.model_dump() for m in tiering.promotions], ensure_ascii=False),
+                json.dumps([m.model_dump() for m in tiering.demotions], ensure_ascii=False),
+                json.dumps(trace.usage.as_dict()),
+                run_id,
+            ),
         )
-        if run_id:
-            await conn.execute(
-                """
-                UPDATE dream_runs SET status = 'succeeded', finished_at = now(), wiki_files_changed = %s,
-                  cache_promotions = %s::jsonb, memory_demotions = %s::jsonb, token_usage = %s::jsonb
-                WHERE id = %s
-                """,
-                (
-                    files,
-                    json.dumps([m.model_dump() for m in tiering.promotions], ensure_ascii=False),
-                    json.dumps([m.model_dump() for m in tiering.demotions], ensure_ascii=False),
-                    json.dumps(trace.usage.as_dict()),
-                    run_id,
-                ),
-            )
     if archive.notes:
         trace.event("archive_notes", notes=archive.notes[:2000])
 

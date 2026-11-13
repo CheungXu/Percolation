@@ -6,7 +6,7 @@ Percolation 运行配置目录。真实凭据存放在 `*.env`（已被 `config/
 
 | 文件 | 用途 | 关键约定 |
 | --- | --- | --- |
-| `db.env` (`db.env.example`) | PostgreSQL 连接与连接池参数 | `DATABASE_URL` / `PGUSER` 固定使用受强制 RLS 约束的 `percolation_app`；`MIGRATE_DATABASE_URL` 使用 `percolation_owner`，仅限 DDL 迁移脚本调用，禁止业务代码读取。 |
+| `db.env` (`db.env.example`) | PostgreSQL 连接与连接池参数 | `DATABASE_URL` / `PGUSER` 固定使用受强制 RLS 约束的 `percolation_app`；`MIGRATE_DATABASE_URL` 使用 `percolation_owner`，仅限 DDL 迁移与运维工具（`e2e_percolation.py`、`backfill_workspace_head.py`、`trace_cli.py reproduce` 建/删 `e2e-`/`replay-` 临时租户）调用；在线服务、检索与整理的运行路径禁止读取。 |
 | `storage.env` (`storage.env.example`) | 共享文件存储与沙箱参数 | 定义 `NAS_ROOT_DIR`（`/mnt/percolation`）、单用户阶段默认租户 `DEFAULT_USER_SLUG` / `DEFAULT_USER_ID`、沙箱驱动 `SANDBOX_DRIVER`（`bwrap`）、连发合并窗口 `BURST_WINDOW_SECONDS`（默认 180 秒）以及 `MEMORY_LINE_LIMIT`（默认 200 行）。 |
 | `llm.env` (`llm.env.example`) | 模型通道 API 密钥 | 存放阿里云百炼 `QWEN_API_KEY` 与火山方舟 `ARK_API_KEY`。 |
 | `models.json` | 逻辑槽位与多模型目录 | 通过 `slots` 将业务能力解耦映射到具体模型定义，切换模型时无需改动业务代码。`pricing` 字段（人民币 / 每百万 token：`input`、`cached_input`、`output`）用于成本账本，没配的模型成本记为未知。 |

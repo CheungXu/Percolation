@@ -35,6 +35,7 @@ class Services:
     pool: AsyncConnectionPool
     sandbox: SandboxExecutor = field(default_factory=BwrapSandbox)
     chat_overrides: dict[str, ChatClient] = field(default_factory=dict)
+    trace_metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     async def open(cls, settings: Settings | None = None) -> Services:
@@ -72,7 +73,14 @@ class Services:
             trace=trace,
             deps=self,
             chat_clients=dict(self.chat_overrides),
+            replay=bool(trace.metadata.get("replay_of")),
         )
+
+    async def capture_env(self, user: UserRef, ws: Workspace, **kwargs: Any) -> dict[str, Any]:
+        """执行环境锚点（工作区版本、库水位、代码/依赖/配置指纹），见 percolation.env_anchor。"""
+        from percolation.env_anchor import capture_env
+
+        return await capture_env(self, user, ws, **kwargs)
 
     # ---- 轨迹 ----
     @cached_property
@@ -115,7 +123,7 @@ class Services:
         telemetry = self.settings.telemetry
         return Trace(
             name=name,
-            metadata={"service": "percolation", "tenant_id": user.id, "user_slug": user.slug, **metadata},
+            metadata={"service": "percolation", "tenant_id": user.id, "user_slug": user.slug, **self.trace_metadata, **metadata},
             budget=Budget(max_cost=telemetry.max_cost, max_tokens=telemetry.max_tokens),
         )
 

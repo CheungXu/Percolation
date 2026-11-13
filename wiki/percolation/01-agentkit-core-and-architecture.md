@@ -43,7 +43,7 @@ flowchart TB
 
     Retriever["retriever.py (双轨混合召回 RRF + Rerank + 一跳邻居 + 批次原话)"]
     Indexer["indexer.py + wiki.py (确定性 Markdown 解析 + SHA256 增量向量同步)"]
-    MemFS["memory_fs.py (200行与禁推测校验钩子 + 工作区 Git 快照/回滚)"]
+    MemFS["memory_fs.py (200行与禁推测校验钩子 + 工作区 Git 快照 + 整理暂存 worktree/快进)"]
   end
 
   subgraph kitLayer [agentkit 可复用通用内核 - 零业务依赖]

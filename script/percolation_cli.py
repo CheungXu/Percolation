@@ -11,6 +11,7 @@
   code/.venv/bin/python script/percolation_cli.py reindex
 
 --user 指定租户 slug，缺省为 config/storage.env 的 DEFAULT_USER_SLUG。
+reindex 与整理共用同一把租户咨询锁：整理进行中会直接退出，不会和发布事务交错。
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 from percolation import graph  # noqa: E402
 from percolation.agents import dream, search  # noqa: E402
 from percolation.capture import capture  # noqa: E402
-from percolation.indexer import sync_wiki  # noqa: E402
 from percolation.services import Services  # noqa: E402
 
 
@@ -83,7 +83,10 @@ async def status(services: Services, user) -> dict:
         "user": {"slug": user.slug, "id": user.id},
         "state": {
             k: state[k]
-            for k in ("dirty_since", "pending_msg_count", "pending_cache_hits", "memory_line_count", "last_dream_at", "last_defrag_at")
+            for k in (
+                "dirty_since", "pending_msg_count", "pending_cache_hits", "memory_line_count",
+                "last_dream_at", "last_defrag_at", "workspace_head",
+            )
         },
         "raw_messages": {row["dream_status"]: row["n"] for row in counts},
         "wiki": {**dict(chunks), **dict(pages_cnt), **dict(facets_cnt)},
@@ -155,7 +158,10 @@ async def main() -> None:
         elif args.command == "status":
             dump(await status(services, user))
         elif args.command == "reindex":
-            dump((await sync_wiki(services, user, services.workspace(user))).as_dict())
+            report = await dream.reindex(services, user)
+            if report is None:
+                raise SystemExit("该租户正在整理，稍后再试")
+            dump(report.as_dict())
     finally:
         await services.close()
 
