@@ -87,9 +87,11 @@ def _deps_hash() -> str:
 def code_env(repo_root: Path) -> dict[str, Any]:
     """进程级缓存：代码和依赖在进程生命周期内不变。"""
     migrations = sorted(p.name for p in (repo_root / "code" / "db" / "migrations").glob("*.sql"))
-    dirty = _run("git", "status", "--porcelain", "--", *CODE_DIRS, "config/models.json", "config/facets.json", cwd=repo_root)
+    dirty = _run(
+        "git", "--no-optional-locks", "status", "--porcelain", "--", *CODE_DIRS, "config/models.json", "config/facets.json", cwd=repo_root
+    )
     return {
-        "code_commit": _run("git", "rev-parse", "HEAD", cwd=repo_root) or None,
+        "code_commit": _run("git", "--no-optional-locks", "rev-parse", "HEAD", cwd=repo_root) or None,
         "code_dirty": bool(dirty),
         "code_digest": code_digest(repo_root),
         "migration": migrations[-1] if migrations else None,
@@ -143,7 +145,7 @@ async def db_watermark(services: Services, user: UserRef, *, as_of: datetime | N
         row = await (
             await conn.execute(
                 """
-                SELECT COALESCE(%s::timestamptz, now()) AS as_of, u.workspace_head, u.next_msg_seq,
+                SELECT COALESCE(%s::timestamptz, clock_timestamp()) AS as_of, u.workspace_head, u.next_msg_seq,
                        u.pending_cache_hits, u.pending_msg_count, u.memory_line_count, u.last_dream_at,
                        u.last_defrag_at, u.dirty_since, u.created_at,
                        (SELECT max(msg_seq) FROM raw_messages) AS max_msg_seq,
@@ -224,7 +226,7 @@ def attach(trace, anchor: dict[str, Any]) -> None:
 
 
 def set_decision(trace, **decision: Any) -> None:
-    """整理的模式判定与理由补进锚点：复现时按原模式强制重跑，并核对判定是否一致。"""
+    """整理的模式判定与理由补进锚点：复现时按原入参重新走判定，并在报告里核对模式与理由是否一致。"""
     env = trace.root.attributes.get("env")
     if isinstance(env, dict):
         env["decision"] = {**env.get("decision", {}), **decision}

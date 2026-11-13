@@ -40,6 +40,7 @@ from percolation.memory_fs import (
     gc_auto,
     git_commit,
     git_head,
+    git_reset_mixed,
     line_count,
     prune_merged_staging_branches,
     remove_staging,
@@ -370,13 +371,21 @@ async def prepare_workspace(
     pruned = prune_merged_staging_branches(main)
     if pruned:
         notes["pruned_branches"] = pruned
-    external = git_commit(main, "external edits") if changed_files(main) else None
-    head = git_head(main)
-    if external or head != published:
+    dirty = bool(changed_files(main))
+    prev_head = git_head(main)
+    if dirty or prev_head != published:
+        # 先算慢速向量计划再提交，把 HEAD != workspace_head 窗口缩到毫秒级事务，且失败不留半截提交
         plan = await plan_sync(services, user, main)
-        async with services.tx(user) as conn:
-            report = await apply_sync(conn, user, plan)
-            await conn.execute("UPDATE users SET workspace_head = %s WHERE id = %s", (head, user.id))
+        external = git_commit(main, "external edits") if dirty else None
+        head = git_head(main)
+        try:
+            async with services.tx(user) as conn:
+                report = await apply_sync(conn, user, plan)
+                await conn.execute("UPDATE users SET workspace_head = %s WHERE id = %s", (head, user.id))
+        except Exception:
+            if external and prev_head:
+                git_reset_mixed(main, prev_head)
+            raise
         notes.update(external_commit=external, published_head=head, docs_rewritten=report.docs_rewritten)
     if notes and trace is not None:
         trace.event("workspace_prepared", **notes)
@@ -392,6 +401,7 @@ async def repair_fast_forward(services: Services, user: UserRef) -> bool:
         if not acquired:
             return False
         main = services.workspace(user)
+        clear_stale_lock(main)
         async with services.tx(user) as conn:
             row = await (await conn.execute("SELECT workspace_head FROM users WHERE id = %s", (user.id,))).fetchone()
         repaired = ensure_published(main, row["workspace_head"] if row else None)

@@ -10,7 +10,7 @@
 | --- | --- |
 | `config.py` | 读 `config/db.env`、`storage.env`、`observability.env`、`llm.env`、`models.json`、`facets.json` |
 | `services.py` | 进程级依赖 `Services`（连接池、模型、沙箱、轨迹仓），作为 `RunContext.deps`；`resolve_user(slug)`、`tx(user)`、`context()`、`new_trace()`、`save_trace()` |
-| `memory_fs.py` | 工作区目录约定、热区写入规则、git 快照；整理暂存区（`create_staging`/`remove_staging`/`fast_forward`/`ensure_published`/`prune_merged_staging_branches`）、残留 `index.lock` 清理与 `gc --auto`；git 子进程统一 60 秒超时 |
+| `memory_fs.py` | 工作区目录约定、热区写入规则、git 快照；整理暂存区（`create_staging`/`remove_staging`/`fast_forward`/`ensure_published`/`prune_merged_staging_branches`）、残留 `index.lock` 清理与 `gc --auto`；`GitCommandError` 透传 `stderr`，全部 git 子进程均设超时（常规 60s、`gc`/`clone` 120s） |
 | `capture.py` | 录入，只走数据库函数 `capture_message` |
 | `wiki.py` | 主题页确定性解析：frontmatter（`type`/`facets`）、小节切片、行内 `[dim:val]`、`[@YYYY-MM-DD]` 事件时间、`[#msg_N]`、`[confirmed]/[inferred]`、`[[rel::target|label]]` 类型链接，以及受控词表合并 |
 | `indexer.py` | `plan_sync`（解析文件、按 `content_hash` 只给新切片算向量、预算悬空链接，不写库）+ `apply_sync(conn, …)`（在调用方事务里幂等刷新 `wiki_pages`、`page_facets`、`message_facets`、`message_events`、`wiki_chunks`、`wiki_links`）；`sync_wiki` 是两者组合 |
@@ -53,7 +53,7 @@
 ## Dreaming Agent 流程
 
 1. `list_dirty_users()` 取脏租户，`try_advisory_lock("percolation:dream:<uid>")` 防重入，拿不到锁返回 `locked`。`reindex` 用同一把锁。
-2. `prepare_workspace`：清理超过 10 分钟的 `index.lock`；`users.workspace_head` 领先主工作区时补快进（上次发布在快进前中断），并删掉已并入主线的 `dream/*` 残留分支；主工作区领先 `workspace_head`（人工提交过）或有未提交改动，就先提交、同步索引并登记新的 `workspace_head`。两者分叉、或登记的提交已不存在时报错，需要人工处理。之后主工作区干净、HEAD 等于 `workspace_head`、派生表与 HEAD 一致。
+2. `prepare_workspace`：清理超过 10 分钟的 `index.lock`；`users.workspace_head` 领先主工作区时补快进（上次发布在快进前中断），并删掉已并入主线的 `dream/*` 残留分支；主工作区领先 `workspace_head`（人工提交过）或有未提交改动，就先计算同步计划再提交并同步索引登记新的 `workspace_head`（若发布失败自动 mixed reset 撤回提交，不留孤立版本）。两者分叉、登记的提交已不存在、或补快进被冲突的未提交文件挡住时报错（冲突文件会原样保留并给出 `git stash -u` 恢复指引），需要人工处理。之后主工作区干净、HEAD 等于 `workspace_head`、派生表与 HEAD 一致。
 3. 记执行环境锚点（见下文），时钟 `as_of` 取库时钟（复现时注入原值）。
 4. 节奏 `decide_mode(…, as_of)`：`MEMORY.md` 超过 90% 上限、悬空链接 ≥ 5、或距上次重整（或建号）≥ 7 天时为 `defrag`，否则 `incremental`；模式与理由写进锚点的 `decision`。没有待整理原话、也没有升降级需求时直接 `noop`。待整理原话只取锚点水位 `max_msg_seq` 以内的。
 5. 建暂存 worktree：`/mnt/percolation/staging/<uid>/<run_id>`（0700），分支 `dream/<run_id>`。之后所有写入都只发生在这里，检索只读主工作区与已发布索引。
@@ -69,7 +69,7 @@
 每次 `ask()` 和整理开跑前调 `Services.capture_env()`，写进根 span 的 `env`（完整）、`env_digest`（代码+依赖+配置的摘要）和 `env_watermark`（关键水位，同时进索引行）：
 
 - 工作区：`workspace_head`（库里登记的已发布版本）、`git_head`、`workspace_mismatch`、`git_clean`（只有检索检查；git 出错时记 `null`，不影响检索）。
-- 库水位（单条语句读出）：`as_of`（库时钟）、`max_msg_seq`、当时 pending 的序号、检索日志条数与最晚时间、用户状态计数（含 `created_at`，节奏判定要用）。
+- 库水位（单条语句读出）：`as_of`（库实时时钟 `clock_timestamp()`）、`max_msg_seq`、当时 pending 的序号、检索日志条数与最晚时间、用户状态计数（含 `created_at`，节奏判定要用）。
 - 代码与依赖（进程内只算一次）：`code_commit`、`code_dirty`、`code_digest`（`agentkit` + `percolation` 源码/提示词/技能）、最新迁移、Python 版本、依赖清单哈希、git/rg/bwrap 版本。
 - 配置：`models.json`、`facets.json` 哈希，`MEMORY_LINE_LIMIT`、`BURST_WINDOW_SECONDS`、时区、检索常量、整理常量。
 - 整理另有 `decision`：模式、理由、待整理序号、晋升候选。
@@ -82,8 +82,8 @@
 2. 每次重跑建一个全新 `replay-<trace8>-<ts>-rN` 租户（建之前先登记，中途失败也会被清理）；原工作区 `git clone` 后 reset 到锚点 `git_head`。
 3. 建表账号单事务复制三张事实表：`as_of` 之前的检索日志（id 重映射）、`max_msg_seq` 以内的原话（保留序号/批次/录入时间/来源，锚点时 pending 的恢复为 pending，`reply_to_search_id` 按映射改写）、用户状态计数与 `next_msg_seq`。
 4. 派生表不复制，按文件 `plan_sync`/`apply_sync` 重建，向量按 `content_hash` 复用原租户的。
-5. 以原入参重跑（检索：原问题与澄清；整理：锚点里的模式），注入 `as_of`；新轨迹带 `replay_of`/`replay_run`，`RunContext.replay=True`，带 `side_effect` 标签的工具被循环拦截。
-6. 报告：检索比 outcome/路由/维度与日期条件/核验序号/命中页/回答/成本/耗时/指纹；整理比状态/模式/归档与跳过集合/改动文件/晋升/索引计数，并逐文件比对原提交与重跑提交的内容；另列水位核对和代码/依赖/配置差异。锚点显示原运行时工作区有未提交改动（`git_clean=false`/`null`）或工作区与已发布索引不一致时，报告开头给出 `warnings`；原话引用了水位外检索日志的条数记在 `setup.unmapped_replies`。代码摘要不同时给出用原提交开 worktree 复现的命令。
+5. 以原入参重跑（检索：原问题与澄清；整理：原入参 `requested_mode`，自动整理保持为空以便重新执行 `decide_mode`），注入 `as_of`；新轨迹带 `replay_of`/`replay_run`，`RunContext.replay=True`，带 `side_effect` 标签的工具被循环拦截。
+6. 报告：检索比 outcome/路由/维度与日期条件/核验序号/命中页/回答/成本/耗时/指纹；整理比状态/模式/判定理由（`decision_reasons`）/归档与跳过集合/改动文件/晋升/索引计数，并逐文件比对原提交与重跑提交的内容；另列水位核对和代码/依赖/配置差异。锚点显示原运行时工作区有未提交改动（`git_clean=false`/`null`）或工作区与已发布索引不一致时，报告开头给出 `warnings`；原话引用了水位外检索日志的条数记在 `setup.unmapped_replies`。代码摘要不同时给出用原提交开 worktree 复现的命令。
 7. 默认删掉 replay 租户（库行、工作区、暂存区），回放轨迹保留；`list`/`stats` 默认不含回放。
 
 ## 轨迹

@@ -105,7 +105,7 @@ TraceStore(Path("/data/telemetry")).save(ctx.trace)   # 落盘完整轨迹
 - 超过阈值的字符串、以及资产原文外置为 `{"$ref": "sha256:…", "chars": N}`；`load(id, hydrate=True)` 还原。
 - `redact` 在落盘与导出前作用于整份 JSON；导出失败只打 stderr，不影响落盘。
 - 索引行除用量、成本、指纹外，还带根 span 属性里的 `env_digest`、`env_watermark`（业务层的执行环境锚点摘要），列表与统计不用解压轨迹。
-- `purge(predicate, dry_run=False, blob_grace_seconds=3600)`：按索引行条件删轨迹，索引文件持排他锁原地重写（追加也持同一把锁，不会丢行），再对 blobs 做标记-清扫；只删无人引用且超过宽限期的 blob，避开并发落盘时“blob 已写、轨迹未写”的窗口。
+- `purge(predicate, dry_run=False, blob_grace_seconds=3600)`：按索引行条件删轨迹，索引文件持排他锁原地重写（追加也持同一把锁，不会丢行），再对 blobs 做标记-清扫；只删无人引用且超过宽限期的 blob，且 `put_blob` 命中已有旧文件时会 `utime` 刷新 `mtime`，避开并发落盘时“blob 已存在或刚写入、轨迹尚未落盘”的窗口。
 
 `OtlpExporter(endpoint, headers=..., project=...)` 直接拼 protobuf，保留原 trace_id/span_id/时间戳，所以实时导出和事后回放得到同一棵树。成本以 `agentkit.cost_cny` 导出，不冒充 `llm.cost`（美元）；token 只写在 LLM span 上，避免后端重复累计。
 

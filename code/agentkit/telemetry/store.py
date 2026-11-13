@@ -84,7 +84,10 @@ class TraceStore:
     def put_blob(self, text: str) -> str:
         digest = sha256_text(text)
         path = self.blob_path(digest)
-        if not path.exists():
+        try:
+            # 命中已有 blob 时刷新 mtime，使并发落盘中的引用重新进入宽限期保护，不会被 purge 误删
+            os.utime(path, None)
+        except FileNotFoundError:
             self._write_atomic(path, self._compressor().compress(text.encode("utf-8")))
         return digest
 

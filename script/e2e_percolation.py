@@ -278,8 +278,11 @@ async def scenario_reproduce(services: Services, cache_trace: str, facet_trace: 
             hits = sum(r["same"]["outcome"] and r["same"]["route_path"] for r in runs)
             check(f"复现{label}：至少一次结果与路由与原运行一致", hits >= 1, [r["summary"]["answer"][:80] for r in runs])
         else:
-            same = sum(r["same"]["status"] and r["same"]["mode"] and r["same"]["archived"] for r in runs)
-            check(f"复现{label}：两次重跑模式与归档集合都与原运行一致", same == 2, [r["summary"] for r in runs])
+            same = sum(
+                r["same"]["status"] and r["same"]["mode"] and r["same"]["decision_reasons"] and r["same"]["archived"]
+                for r in runs
+            )
+            check(f"复现{label}：两次重跑模式、判定理由与归档集合都与原运行一致", same == 2, [r["summary"] for r in runs])
     owner_url = load_env_file(ROOT / "config" / "db.env")["MIGRATE_DATABASE_URL"]
     from agentkit.tenancy import create_pool
 

@@ -23,8 +23,18 @@ INITIAL_MEMORY = """# 运行注入区
 """
 
 GIT_IDENTITY = ["-c", "user.name=percolation-dream", "-c", "user.email=dream@percolation.local"]
-STALE_LOCK_SECONDS = 600
+STALE_LOCK_SECONDS = 90
 GIT_TIMEOUT_SECONDS = 60
+GC_TIMEOUT_SECONDS = 120
+
+
+class GitCommandError(subprocess.CalledProcessError):
+    """保留 CalledProcessError 继承关系，同时在 str() 中带上 git stderr 便于排障。"""
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        detail = (self.stderr or self.output or "").strip()
+        return f"{base}: {detail}" if detail else base
 
 
 def open_workspace(root: Path) -> Workspace:
@@ -65,11 +75,22 @@ def memory_validators(limit: int):
     return (memory_rules, path_rules)
 
 
-def _git(root: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, text=True, check=True, timeout=GIT_TIMEOUT_SECONDS
-    )
+def _git(root: Path, *args: str, timeout: int = GIT_TIMEOUT_SECONDS) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True, text=True, check=True, timeout=timeout
+        )
+    except subprocess.CalledProcessError as exc:
+        raise GitCommandError(exc.returncode, exc.cmd, output=exc.output, stderr=exc.stderr) from None
     return result.stdout
+
+
+def _git_best_effort(root: Path, *args: str, timeout: int = GIT_TIMEOUT_SECONDS) -> None:
+    """用于清理与后台维护命令：加超时保护，失败或超时均不中断主流程。"""
+    try:
+        subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def changed_files(ws: Workspace) -> list[str]:
@@ -91,6 +112,11 @@ def git_commit(ws: Workspace, message: str) -> str | None:
     return _git(ws.root, "rev-parse", "--short", "HEAD").strip()
 
 
+def git_reset_mixed(ws: Workspace, rev: str) -> None:
+    """把 HEAD 撤回到 rev，但保留工作区与暂存区改动不丢。"""
+    _git(ws.root, "reset", "-q", "--mixed", rev)
+
+
 def git_head(ws: Workspace | Path) -> str | None:
     root = ws.root if isinstance(ws, Workspace) else ws
     try:
@@ -109,7 +135,9 @@ def commit_exists(ws: Workspace, rev: str) -> bool:
 
 def is_ancestor(ws: Workspace, ancestor: str, descendant: str) -> bool:
     result = subprocess.run(
-        ["git", "-C", str(ws.root), "merge-base", "--is-ancestor", ancestor, descendant], capture_output=True
+        ["git", "-C", str(ws.root), "merge-base", "--is-ancestor", ancestor, descendant],
+        capture_output=True,
+        timeout=GIT_TIMEOUT_SECONDS,
     )
     return result.returncode == 0
 
@@ -124,7 +152,7 @@ def clear_stale_lock(ws: Workspace, max_age_seconds: int = STALE_LOCK_SECONDS) -
 
 
 def gc_auto(ws: Workspace) -> None:
-    subprocess.run(["git", "-C", str(ws.root), "gc", "--auto", "--quiet"], capture_output=True)
+    _git_best_effort(ws.root, "gc", "--auto", "--quiet", timeout=GC_TIMEOUT_SECONDS)
 
 
 # ---- 暂存区：整理在独立 worktree 里写，成功后主工作区快进，失败整个丢弃 ----
@@ -147,19 +175,19 @@ def create_staging(main: Workspace, path: Path, branch: str) -> Workspace:
 
 
 def remove_staging(main: Workspace, path: Path, branch: str, *, keep_branch: bool = False) -> None:
-    subprocess.run(["git", "-C", str(main.root), "worktree", "remove", "--force", str(path)], capture_output=True)
+    _git_best_effort(main.root, "worktree", "remove", "--force", str(path))
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
-    subprocess.run(["git", "-C", str(main.root), "worktree", "prune"], capture_output=True)
+    _git_best_effort(main.root, "worktree", "prune")
     if not keep_branch:
-        subprocess.run(["git", "-C", str(main.root), "branch", "-q", "-D", branch], capture_output=True)
+        _git_best_effort(main.root, "branch", "-q", "-D", branch)
 
 
 def prune_merged_staging_branches(main: Workspace) -> list[str]:
     """快进补齐后，之前为保住提交而留下的 dream/* 分支已并入主线，可以删掉。"""
     merged = _git(main.root, "branch", "--format=%(refname:short)", "--merged", "HEAD", "--list", "dream/*").split()
     for branch in merged:
-        subprocess.run(["git", "-C", str(main.root), "branch", "-q", "-D", branch], capture_output=True)
+        _git_best_effort(main.root, "branch", "-q", "-D", branch)
     return merged
 
 
@@ -181,5 +209,11 @@ def ensure_published(main: Workspace, published_head: str | None) -> bool:
         return False
     if current and not is_ancestor(main, current, published_head):
         raise RuntimeError(f"主工作区 HEAD {current[:8]} 与已发布版本 {published_head[:8]} 分叉，需要人工处理")
-    fast_forward(main, published_head)
+    try:
+        fast_forward(main, published_head)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"主工作区落后于已发布版本 {published_head[:8]}，补快进被未提交文件挡住"
+            f"（可执行 git -C {main.root} stash -u 暂存冲突文件后再 reindex）：{exc}"
+        ) from exc
     return True

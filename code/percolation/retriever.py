@@ -23,6 +23,7 @@ from percolation.wiki import format_facets_summary, merge_facets
 RRF_K = 60
 PER_ROUTE_LIMIT = 20
 PENDING_LIMIT = 60
+PENDING_DATE_LIMIT = 20
 RERANK_POOL = 40
 TRGM_THRESHOLD = 0.35
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
@@ -69,8 +70,13 @@ class Hit:
         meta = f" [{self.page_type}" + (f" · {facet_str}" if facet_str else "") + "]"
         if self.kind == "wiki":
             return f"{self.title}{meta} / {self.heading}\n{self.content}"[:1500]
+        when = ""
+        if self.captured_at:
+            dt = self.captured_at.astimezone(LOCAL_TZ)
+            when = f" · 录入 {dt:%Y-%m-%d}({WEEKDAYS_ZH[dt.weekday()]})"
+        ev = f" · 事件 {','.join(self.event_dates)}" if self.event_dates else ""
         extra = f"（{facet_str}）" if facet_str else ""
-        return f"原话 #{self.msg_seq}{extra}：{self.content}"[:1500]
+        return f"原话 #{self.msg_seq}{when}{ev}{extra}：{self.content}"[:1500]
 
     def render(self) -> str:
         score = f" 相关度 {self.score:.2f}" if self.score is not None else ""
@@ -118,7 +124,9 @@ class RetrievalResult:
         parts: list[str] = []
         if self.date_filtered is False and any(self.date_range):
             span_text = f"{self.date_range[0] or ''}..{self.date_range[1] or ''}"
-            parts.append(f"（注：未找到精确落在日期范围 {span_text} 内的已归档记录，以下为按关键词/语义召回的相近记录）")
+            parts.append(
+                f"（注：未找到同时满足查询条件且精确落在日期范围 {span_text} 内的已归档记录，以下包含相近记录，请核对各自日期）"
+            )
         parts.extend(hit.render() for hit in self.hits)
         if self.neighbors:
             items = []
@@ -195,11 +203,12 @@ async def _matching_date_targets(
     d_from: date | None,
     d_to: date | None,
     time_field: str,
-) -> tuple[set[str], set[int]]:
-    """计算精确落在指定日期窗口内的 (wiki_chunk_ids, raw_msg_seqs)。"""
+) -> tuple[set[str], set[str], set[int], set[int]]:
+    """计算精确落在指定日期窗口内的 (event_chunks, captured_chunks, event_seqs, captured_seqs)。"""
     use_event = time_field in {"any", "event"}
     use_captured = time_field in {"any", "captured"}
-    matched_seqs: set[int] = set()
+    event_seqs: set[int] = set()
+    captured_seqs: set[int] = set()
     if use_event:
         for row in await (
             await conn.execute(
@@ -211,7 +220,7 @@ async def _matching_date_targets(
                 (d_from, d_from, d_to, d_to),
             )
         ).fetchall():
-            matched_seqs.add(int(row["msg_seq"]))
+            event_seqs.add(int(row["msg_seq"]))
     if use_captured:
         for row in await (
             await conn.execute(
@@ -223,27 +232,42 @@ async def _matching_date_targets(
                 (d_from, d_from, d_to, d_to),
             )
         ).fetchall():
-            matched_seqs.add(int(row["msg_seq"]))
+            captured_seqs.add(int(row["msg_seq"]))
 
-    matched_chunks: set[str] = set()
-    if matched_seqs:
+    event_chunks: set[str] = set()
+    if event_seqs:
         for row in await (
             await conn.execute(
                 "SELECT id::text AS id FROM wiki_chunks WHERE source_msg_seqs && %s::bigint[]",
-                (sorted(matched_seqs),),
+                (sorted(event_seqs),),
             )
         ).fetchall():
-            matched_chunks.add(row["id"])
-    return matched_chunks, matched_seqs
+            event_chunks.add(row["id"])
+
+    captured_only_seqs = captured_seqs - event_seqs
+    captured_chunks: set[str] = set()
+    if captured_only_seqs:
+        for row in await (
+            await conn.execute(
+                "SELECT id::text AS id FROM wiki_chunks WHERE source_msg_seqs && %s::bigint[]",
+                (sorted(captured_only_seqs),),
+            )
+        ).fetchall():
+            if row["id"] not in event_chunks:
+                captured_chunks.add(row["id"])
+    return event_chunks, captured_chunks, event_seqs, captured_seqs
 
 
 async def _facet_and_time_routes(
     conn: AsyncConnection,
     facets: dict[str, list[str]],
-    date_chunk_ids: set[str],
-    date_raw_seqs: set[int],
-) -> tuple[list[str], list[int]]:
-    """第四路召回：按切片级正交维度交集度与日期命中排序召回切片和原话。"""
+    event_chunk_ids: set[str],
+    captured_chunk_ids: set[str],
+    event_raw_seqs: set[int],
+    captured_raw_seqs: set[int],
+    time_field: str,
+) -> tuple[list[str], list[int], set[str]]:
+    """第四路召回：按切片级正交维度交集度与日期命中排序召回切片和原话，并返回命中维度的键集合。"""
     dims: list[str] = []
     vals: list[str] = []
     for dim, dim_vals in facets.items():
@@ -251,6 +275,7 @@ async def _facet_and_time_routes(
             dims.append(dim)
             vals.append(val)
 
+    facet_keys: set[str] = set()
     chunk_scores: dict[str, tuple[int, int]] = {}
     if dims:
         for row in await (
@@ -271,7 +296,10 @@ async def _facet_and_time_routes(
             )
         ).fetchall():
             chunk_scores[row["id"]] = (row["matched"] * 2, row["chunk_index"])
+            facet_keys.add(f"w:{row['id']}")
 
+    cap_bonus = 2 if time_field == "captured" else 1
+    date_chunk_ids = event_chunk_ids | captured_chunk_ids
     if date_chunk_ids:
         for row in await (
             await conn.execute(
@@ -279,8 +307,10 @@ async def _facet_and_time_routes(
                 (sorted(date_chunk_ids),),
             )
         ).fetchall():
-            prev_score, idx = chunk_scores.get(row["id"], (0, row["chunk_index"]))
-            chunk_scores[row["id"]] = (prev_score + 2, idx)
+            cid = row["id"]
+            bonus = 3 if cid in event_chunk_ids else cap_bonus
+            prev_score, idx = chunk_scores.get(cid, (0, row["chunk_index"]))
+            chunk_scores[cid] = (prev_score + bonus, idx)
 
     wiki_ids = [
         cid for cid, _ in sorted(chunk_scores.items(), key=lambda kv: (-kv[1][0], kv[1][1], kv[0]))[:PER_ROUTE_LIMIT]
@@ -300,12 +330,16 @@ async def _facet_and_time_routes(
                 (dims, vals),
             )
         ).fetchall():
-            msg_scores[int(row["msg_seq"])] += row["matched"] * 2
-    for seq in date_raw_seqs:
-        msg_scores[seq] += 2
+            seq = int(row["msg_seq"])
+            msg_scores[seq] += row["matched"] * 2
+            facet_keys.add(f"r:{seq}")
+    for seq in event_raw_seqs:
+        msg_scores[seq] += 3
+    for seq in captured_raw_seqs - event_raw_seqs:
+        msg_scores[seq] += cap_bonus
 
     raw_seqs = sorted(msg_scores, key=lambda s: (-msg_scores[s], -s))[:PER_ROUTE_LIMIT]
-    return wiki_ids, raw_seqs
+    return wiki_ids, raw_seqs, facet_keys
 
 
 async def search(
@@ -340,34 +374,57 @@ async def search(
         vectors = [to_vector_literal(v) for v in embedded]
 
     rrf: dict[str, float] = defaultdict(float)
+    lexical_facet_rrf: dict[str, float] = defaultdict(float)
     text_raw_hits: set[int] = set()
     date_filtered: bool | None = None
 
     async with services.tx(user) as conn:
-        date_chunk_ids: set[str] = set()
-        date_raw_seqs: set[int] = set()
+        event_chunk_ids: set[str] = set()
+        captured_chunk_ids: set[str] = set()
+        event_raw_seqs: set[int] = set()
+        captured_raw_seqs: set[int] = set()
         if has_date:
-            date_chunk_ids, date_raw_seqs = await _matching_date_targets(conn, d_from, d_to, effective_time_field)
+            event_chunk_ids, captured_chunk_ids, event_raw_seqs, captured_raw_seqs = await _matching_date_targets(
+                conn, d_from, d_to, effective_time_field
+            )
+        date_chunk_ids = event_chunk_ids | captured_chunk_ids
+        date_raw_seqs = event_raw_seqs | captured_raw_seqs
 
         for query, vector in zip(queries, vectors, strict=True):
             if has_chunks:
-                for route in await _wiki_routes(conn, query, vector):
+                for route_idx, route in enumerate(await _wiki_routes(conn, query, vector)):
                     for rank, chunk_id in enumerate(route):
-                        rrf[f"w:{chunk_id}"] += 1.0 / (RRF_K + rank + 1)
+                        key = f"w:{chunk_id}"
+                        score = 1.0 / (RRF_K + rank + 1)
+                        rrf[key] += score
+                        # route 0/1 是 FTS 与 trgm；route 2 是无距离阈值的向量路，小库下会返回全量切片
+                        if route_idx < 2:
+                            lexical_facet_rrf[key] += score
             for rank, seq in enumerate(await _raw_route(conn, query)):
-                rrf[f"r:{seq}"] += 1.0 / (RRF_K + rank + 1)
+                key = f"r:{seq}"
+                score = 1.0 / (RRF_K + rank + 1)
+                rrf[key] += score
+                lexical_facet_rrf[key] += score
                 text_raw_hits.add(seq)
 
         if norm_facets or has_date:
-            facet_wiki_ids, facet_raw_seqs = await _facet_and_time_routes(
-                conn, norm_facets, date_chunk_ids, date_raw_seqs
+            facet_wiki_ids, facet_raw_seqs, facet_keys = await _facet_and_time_routes(
+                conn, norm_facets, event_chunk_ids, captured_chunk_ids, event_raw_seqs, captured_raw_seqs, effective_time_field
             )
             for rank, chunk_id in enumerate(facet_wiki_ids):
-                rrf[f"w:{chunk_id}"] += 1.5 / (RRF_K + rank + 1)
+                key = f"w:{chunk_id}"
+                score = 1.5 / (RRF_K + rank + 1)
+                rrf[key] += score
+                if key in facet_keys:
+                    lexical_facet_rrf[key] += score
             for rank, seq in enumerate(facet_raw_seqs):
-                rrf[f"r:{seq}"] += 1.5 / (RRF_K + rank + 1)
+                key = f"r:{seq}"
+                score = 1.5 / (RRF_K + rank + 1)
+                rrf[key] += score
+                if key in facet_keys:
+                    lexical_facet_rrf[key] += score
 
-        pending_set: set[int] = set()
+        pending_keep: set[int] = set()
         if queries:
             pending_rows = await (
                 await conn.execute(
@@ -375,33 +432,40 @@ async def search(
                     (PENDING_LIMIT,),
                 )
             ).fetchall()
-            pending_set = {int(row["msg_seq"]) for row in pending_rows}
+            pending_seqs_desc = [int(row["msg_seq"]) for row in pending_rows]
+            pending_set = set(pending_seqs_desc)
             if not has_date:
                 for seq in pending_set:
                     rrf.setdefault(f"r:{seq}", 0.0)
             else:
-                # 指定日期时，只让匹配日期或被查询词文本命中的 pending 消息进入候选，不塞入无关全量 pending
-                for seq in pending_set:
-                    if seq in date_raw_seqs or (effective_time_field in {"any", "event"} and seq in text_raw_hits):
-                        rrf.setdefault(f"r:{seq}", 0.0)
+                # pending 原话尚未经夜间整理抽取 [@日期]，事件日期提问保留最近一批进重排池（不要求字面撞词）
+                if effective_time_field in {"any", "event"}:
+                    pending_keep = set(pending_seqs_desc[:PENDING_DATE_LIMIT]) | (pending_set & text_raw_hits)
+                for seq in (pending_set & date_raw_seqs) | pending_keep:
+                    rrf.setdefault(f"r:{seq}", 0.0)
 
         if has_date:
-            if date_chunk_ids or date_raw_seqs:
+            date_keys = {f"w:{cid}" for cid in date_chunk_ids} | {f"r:{seq}" for seq in date_raw_seqs}
+            if not queries and not norm_facets:
                 date_filtered = True
-                allow_unindexed_pending = effective_time_field in {"any", "event"}
                 for key in list(rrf):
-                    if key.startswith("w:") and key[2:] not in date_chunk_ids:
+                    if key not in date_keys:
                         del rrf[key]
-                    elif key.startswith("r:"):
-                        seq = int(key[2:])
-                        if seq in date_raw_seqs:
+            elif date_keys:
+                best_overall_lex = max(lexical_facet_rrf.values(), default=0.0)
+                best_dated_lex = max((lexical_facet_rrf.get(k, 0.0) for k in date_keys), default=0.0)
+                # 只有无明确词法/维度竞争者，或日期窗口内确实存在相当强度的词法/维度命中时才硬筛；
+                # 若高分词法/维度命中全在窗口外（路由算偏日期，且当天碰巧有无关记录），保留两者并标注回退。
+                if best_overall_lex == 0.0 or best_dated_lex >= best_overall_lex * 0.6:
+                    date_filtered = True
+                    for key in list(rrf):
+                        if key in date_keys:
                             continue
-                        if allow_unindexed_pending and seq in pending_set and seq in text_raw_hits:
+                        if key.startswith("r:") and int(key[2:]) in pending_keep:
                             continue
                         del rrf[key]
-            elif not queries and not norm_facets:
-                date_filtered = True
-                rrf.clear()
+                else:
+                    date_filtered = False
             else:
                 date_filtered = False
 

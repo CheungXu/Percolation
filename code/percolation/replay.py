@@ -25,7 +25,7 @@ from typing import Any
 from agentkit.envfile import load_env_file
 from agentkit.tenancy import create_pool
 from percolation.indexer import apply_sync, plan_sync
-from percolation.memory_fs import git_head
+from percolation.memory_fs import GC_TIMEOUT_SECONDS, GIT_TIMEOUT_SECONDS, _git, git_head
 from percolation.services import Services, UserRef
 from percolation.tenants import REPLAY_PREFIX, create_tenant, drop_tenant
 
@@ -70,17 +70,18 @@ def load_original(services: Services, trace_id: str) -> dict[str, Any]:
 # ---- 建环境 ----
 
 
-def _git(root: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True).stdout
-
-
 def clone_workspace(source: Path, target: Path, rev: str) -> None:
     if target.exists():
         raise ReplayError(f"目标工作区已存在：{target}")
     if not (source / ".git").exists():
         raise ReplayError(f"原工作区不存在：{source}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "clone", "-q", "--no-hardlinks", str(source), str(target)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "clone", "-q", "--no-hardlinks", str(source), str(target)],
+        check=True,
+        capture_output=True,
+        timeout=GC_TIMEOUT_SECONDS,
+    )
     try:
         _git(target, "reset", "-q", "--hard", rev)
     except subprocess.CalledProcessError as exc:
@@ -240,7 +241,8 @@ async def rerun(services: Services, user: UserRef, original: dict[str, Any], run
     inputs = root["payload"]["input"]
     if original["name"] == "search":
         return await search.ask(tagged, user, inputs["query"], clarification=inputs.get("clarification"), as_of=as_of)
-    mode = (env.get("decision") or {}).get("mode") or inputs.get("requested_mode")
+    # 按原入参 requested_mode 重跑（自动模式保持 None，让 decide_mode 按 as_of 重新判定并核对是否漂移）
+    mode = inputs["requested_mode"] if "requested_mode" in inputs else (env.get("decision") or {}).get("mode")
     return await dream.run_for_user(tagged, user, mode=mode, as_of=as_of)
 
 
@@ -281,7 +283,15 @@ def watermark_check(original_env: dict[str, Any], replay_env: dict[str, Any]) ->
 def _file_at(root: Path, rev: str | None, path: str) -> str | None:
     if not rev:
         return None
-    result = subprocess.run(["git", "-C", str(root), "show", f"{rev}:{path}"], capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "show", f"{rev}:{path}"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     return result.stdout if result.returncode == 0 else None
 
 
@@ -307,6 +317,8 @@ def summarize(name: str, output: dict[str, Any], trace: dict[str, Any] | None) -
     if name == "search":
         summary["answer"] = (output.get("answer") or "")[:300]
     else:
+        decision = ((root_span(trace)["attributes"].get("env") or {}).get("decision") or {}) if trace else {}
+        summary["decision_reasons"] = decision.get("reasons")
         summary["promotions"] = sorted(m.get("entry_key", "") for m in output.get("promotions") or [])
         index = output.get("index") or {}
         summary["index"] = {

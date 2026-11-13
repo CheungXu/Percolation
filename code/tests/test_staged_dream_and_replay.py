@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import time
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ from agentkit.envfile import load_env_file
 from agentkit.telemetry import TraceStore
 from agentkit.tenancy import try_advisory_lock
 from agentkit.testing import ScriptedChatClient, call_tool, reply
+import percolation.replay as replay_mod
 from percolation import env_anchor, memory_fs, retriever, tenants
 from percolation.replay import anchor_warnings
 from percolation.agents import dream
@@ -136,6 +138,15 @@ def test_trace_purge_removes_tenant_and_sweeps_blobs(tmp_path):
     assert shared in restored["assets"].values()
     assert restored["spans"][0]["payload"]["input"]["text"].startswith("B 独有")
 
+    # 旧 blob（mtime 早已超过宽限期）若正在被并发落盘的轨迹再次 put_blob 引用，mtime 会刷新，purge 不会误删
+    stale_digest = store.put_blob("跨天复用的超长提示词" * 200)
+    stale_path = store.blob_path(stale_digest)
+    old_ts = time.time() - 7200
+    os.utime(stale_path, (old_ts, old_ts))
+    store.put_blob("跨天复用的超长提示词" * 200)
+    swept = store.purge(lambda _row: False)
+    assert swept["blobs_deleted"] == 0 and stale_path.exists()
+
 
 def test_env_digest_ignores_watermark():
     base = {"code": {"code_digest": "x"}, "config": {"models_json": "y"}, "db": {"as_of": "t1", "max_msg_seq": 1}}
@@ -162,8 +173,21 @@ def test_ensure_published_cases(tmp_path):
     # 主工作区落后（快进中断）：补快进，并清掉已并入的暂存分支
     subprocess.run(["git", "-C", str(main.root), "branch", "dream/r1", ahead], check=True)
     subprocess.run(["git", "-C", str(main.root), "reset", "-q", "--hard", base], check=True)
-    assert memory_fs.ensure_published(main, ahead) is True and git_head(main) == ahead
+    # 不重叠的未跟踪文件不会挡住快进，且快进后原样保留
+    extra = main.root / "wiki" / "note.md"
+    extra.write_text("# 笔记\n", encoding="utf-8")
+    assert memory_fs.ensure_published(main, ahead) is True and git_head(main) == ahead and extra.exists()
+    extra.unlink()
     assert memory_fs.prune_merged_staging_branches(main) == ["dream/r1"]
+    # 冲突的未提交改动挡住快进时，保留现场并在异常里带出冲突文件名与 stash 指引
+    subprocess.run(["git", "-C", str(main.root), "branch", "dream/r2", ahead], check=True)
+    subprocess.run(["git", "-C", str(main.root), "reset", "-q", "--hard", base], check=True)
+    (main.root / memory_fs.MEMORY_FILE).write_text("conflicting local edit\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match=r"(?s)stash -u.*MEMORY\.md"):
+        memory_fs.ensure_published(main, ahead)
+    assert (main.root / memory_fs.MEMORY_FILE).read_text(encoding="utf-8") == "conflicting local edit\n"
+    subprocess.run(["git", "-C", str(main.root), "checkout", "--", memory_fs.MEMORY_FILE], check=True)
+    subprocess.run(["git", "-C", str(main.root), "branch", "-q", "-D", "dream/r2"], check=True)
     # 分叉或登记的版本不存在：要人工处理
     subprocess.run(["git", "-C", str(main.root), "reset", "-q", "--hard", base], check=True)
     commit("fork")
@@ -179,6 +203,49 @@ def test_anchor_warnings():
     assert "未提交改动" in anchor_warnings({"workspace": {"git_clean": False}})[0]
     assert "未能确认" in anchor_warnings({"workspace": {"git_clean": None}})[0]
     assert "不一致" in anchor_warnings({"workspace": {"workspace_mismatch": True, "git_head": "a", "workspace_head": "b"}})[0]
+
+
+def test_replay_dream_preserves_requested_mode_and_summarizes_reasons(monkeypatch):
+    from percolation.services import UserRef
+
+    captured: dict = {}
+
+    async def fake_run(services, user, *, mode=None, as_of=None):
+        captured["mode"] = mode
+        captured["as_of"] = as_of
+        return dream.DreamOutcome(user_id=user.id, status="noop", mode="defrag")
+
+    monkeypatch.setattr(dream, "run_for_user", fake_run)
+    original = {
+        "trace_id": "t-orig",
+        "name": "dream",
+        "metadata": {"tenant_id": "u1"},
+        "cost": {"total": 0.01},
+        "duration_ms": 120,
+        "spans": [
+            {
+                "parent_id": None,
+                "kind": "chain",
+                "attributes": {
+                    "env": {
+                        "db": {"as_of": "2026-11-13T10:00:00+00:00"},
+                        "decision": {"mode": "defrag", "reasons": ["interval:8d>=7d"]},
+                    }
+                },
+                "payload": {"input": {"requested_mode": None, "as_of": None}, "output": {"status": "succeeded", "mode": "defrag"}},
+            }
+        ],
+    }
+    dummy_services = Services(settings=None, pool=None)  # type: ignore[arg-type]
+    asyncio.run(replay_mod.rerun(dummy_services, UserRef(id="u2", slug="replay-x", workspace_rel_path="workspaces/u2"), original, 1))
+    # 自动整理复现时保持 mode=None，让 decide_mode 按 as_of 重新判定而不是强制塞入 "defrag"
+    assert captured["mode"] is None
+    assert captured["as_of"] == datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
+
+    base_summary = replay_mod.summarize("dream", original["spans"][0]["payload"]["output"], original)
+    assert base_summary["decision_reasons"] == ["interval:8d>=7d"]
+    drifted = {**base_summary, "decision_reasons": []}
+    assert replay_mod.compare(base_summary, drifted)["decision_reasons"] is False
 
 
 # ---- 隔离租户 + 真实数据库 ----

@@ -125,7 +125,9 @@ class SearchOutcome:
     trace_id: str = ""
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        data["date_range"] = list(self.date_range)
+        return data
 
 
 def _tool_path(event: dict) -> str | None:
