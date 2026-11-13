@@ -285,7 +285,7 @@ def _file_at(root: Path, rev: str | None, path: str) -> str | None:
         return None
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "show", f"{rev}:{path}"],
+            ["git", "--no-optional-locks", "-C", str(root), "show", f"{rev}:{path}"],
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT_SECONDS,
@@ -315,6 +315,8 @@ def summarize(name: str, output: dict[str, Any], trace: dict[str, Any] | None) -
     fields = SEARCH_FIELDS if name == "search" else DREAM_FIELDS
     summary = {key: output.get(key) for key in fields}
     if name == "search":
+        dr = summary.get("date_range")
+        summary["date_range"] = list(dr) if isinstance(dr, (list, tuple)) else [None, None]
         summary["answer"] = (output.get("answer") or "")[:300]
     else:
         decision = ((root_span(trace)["attributes"].get("env") or {}).get("decision") or {}) if trace else {}

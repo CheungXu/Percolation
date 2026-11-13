@@ -75,10 +75,39 @@ def memory_validators(limit: int):
     return (memory_rules, path_rules)
 
 
+def _git_dir(root: Path) -> Path:
+    dot_git = root / ".git"
+    if dot_git.is_file():
+        first = dot_git.read_text(encoding="utf-8", errors="replace").splitlines()
+        if first and first[0].strip().startswith("gitdir:"):
+            target = Path(first[0].strip().removeprefix("gitdir:").strip())
+            return target if target.is_absolute() else (root / target).resolve()
+    return dot_git
+
+
 def _git(root: Path, *args: str, timeout: int = GIT_TIMEOUT_SECONDS) -> str:
     try:
         result = subprocess.run(
             ["git", "-C", str(root), *args], capture_output=True, text=True, check=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        # subprocess.run 超时已 kill 并回收子进程，顺手清掉它刚留下的 index.lock
+        (_git_dir(root) / "index.lock").unlink(missing_ok=True)
+        raise
+    except subprocess.CalledProcessError as exc:
+        raise GitCommandError(exc.returncode, exc.cmd, output=exc.output, stderr=exc.stderr) from None
+    return result.stdout
+
+
+def _git_ro(root: Path, *args: str, timeout: int = GIT_TIMEOUT_SECONDS) -> str:
+    """只读 git 命令统一加 --no-optional-locks，绝不在并发读时刷新 stat 缓存或抢 index.lock。"""
+    try:
+        result = subprocess.run(
+            ["git", "--no-optional-locks", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
         )
     except subprocess.CalledProcessError as exc:
         raise GitCommandError(exc.returncode, exc.cmd, output=exc.output, stderr=exc.stderr) from None
@@ -90,11 +119,11 @@ def _git_best_effort(root: Path, *args: str, timeout: int = GIT_TIMEOUT_SECONDS)
     try:
         subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
-        pass
+        (_git_dir(root) / "index.lock").unlink(missing_ok=True)
 
 
 def changed_files(ws: Workspace) -> list[str]:
-    output = _git(ws.root, "status", "--porcelain", "--untracked-files=all")
+    output = _git_ro(ws.root, "status", "--porcelain", "--untracked-files=all")
     files = []
     for line in output.splitlines():
         path = line[3:].strip()
@@ -109,7 +138,7 @@ def git_commit(ws: Workspace, message: str) -> str | None:
         return None
     _git(ws.root, "add", "-A")
     _git(ws.root, *GIT_IDENTITY, "commit", "-q", "-m", message)
-    return _git(ws.root, "rev-parse", "--short", "HEAD").strip()
+    return _git_ro(ws.root, "rev-parse", "--short", "HEAD").strip()
 
 
 def git_reset_mixed(ws: Workspace, rev: str) -> None:
@@ -120,22 +149,22 @@ def git_reset_mixed(ws: Workspace, rev: str) -> None:
 def git_head(ws: Workspace | Path) -> str | None:
     root = ws.root if isinstance(ws, Workspace) else ws
     try:
-        return _git(root, "rev-parse", "HEAD").strip() or None
+        return _git_ro(root, "rev-parse", "HEAD").strip() or None
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
 
 
 def commit_exists(ws: Workspace, rev: str) -> bool:
     try:
-        _git(ws.root, "cat-file", "-e", f"{rev}^{{commit}}")
+        _git_ro(ws.root, "cat-file", "-e", f"{rev}^{{commit}}")
         return True
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
 
 
 def is_ancestor(ws: Workspace, ancestor: str, descendant: str) -> bool:
     result = subprocess.run(
-        ["git", "-C", str(ws.root), "merge-base", "--is-ancestor", ancestor, descendant],
+        ["git", "--no-optional-locks", "-C", str(ws.root), "merge-base", "--is-ancestor", ancestor, descendant],
         capture_output=True,
         timeout=GIT_TIMEOUT_SECONDS,
     )
@@ -144,7 +173,7 @@ def is_ancestor(ws: Workspace, ancestor: str, descendant: str) -> bool:
 
 def clear_stale_lock(ws: Workspace, max_age_seconds: int = STALE_LOCK_SECONDS) -> bool:
     """进程崩溃会在 NFS 上留下 index.lock，导致之后的提交全部失败。只能在持有整理锁时调用。"""
-    lock = ws.root / ".git" / "index.lock"
+    lock = _git_dir(ws.root) / "index.lock"
     if lock.exists() and time.time() - lock.stat().st_mtime > max_age_seconds:
         lock.unlink(missing_ok=True)
         return True
@@ -185,7 +214,7 @@ def remove_staging(main: Workspace, path: Path, branch: str, *, keep_branch: boo
 
 def prune_merged_staging_branches(main: Workspace) -> list[str]:
     """快进补齐后，之前为保住提交而留下的 dream/* 分支已并入主线，可以删掉。"""
-    merged = _git(main.root, "branch", "--format=%(refname:short)", "--merged", "HEAD", "--list", "dream/*").split()
+    merged = _git_ro(main.root, "branch", "--format=%(refname:short)", "--merged", "HEAD", "--list", "dream/*").split()
     for branch in merged:
         _git_best_effort(main.root, "branch", "-q", "-D", branch)
     return merged

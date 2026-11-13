@@ -10,7 +10,7 @@
 | --- | --- |
 | `config.py` | 读 `config/db.env`、`storage.env`、`observability.env`、`llm.env`、`models.json`、`facets.json` |
 | `services.py` | 进程级依赖 `Services`（连接池、模型、沙箱、轨迹仓），作为 `RunContext.deps`；`resolve_user(slug)`、`tx(user)`、`context()`、`new_trace()`、`save_trace()` |
-| `memory_fs.py` | 工作区目录约定、热区写入规则、git 快照；整理暂存区（`create_staging`/`remove_staging`/`fast_forward`/`ensure_published`/`prune_merged_staging_branches`）、残留 `index.lock` 清理与 `gc --auto`；`GitCommandError` 透传 `stderr`，全部 git 子进程均设超时（常规 60s、`gc`/`clone` 120s） |
+| `memory_fs.py` | 工作区目录约定、热区写入规则、git 快照；整理暂存区（`create_staging`/`remove_staging`/`fast_forward`/`ensure_published`/`prune_merged_staging_branches`）、残留 `index.lock` 清理与 `gc --auto`；只读 git 命令统一 `--no-optional-locks` 不抢锁，写命令超时自动清残留锁，`GitCommandError` 透传 `stderr`，全部 git 子进程均设超时（常规 60s、`gc`/`clone` 120s） |
 | `capture.py` | 录入，只走数据库函数 `capture_message` |
 | `wiki.py` | 主题页确定性解析：frontmatter（`type`/`facets`）、小节切片、行内 `[dim:val]`、`[@YYYY-MM-DD]` 事件时间、`[#msg_N]`、`[confirmed]/[inferred]`、`[[rel::target|label]]` 类型链接，以及受控词表合并 |
 | `indexer.py` | `plan_sync`（解析文件、按 `content_hash` 只给新切片算向量、预算悬空链接，不写库）+ `apply_sync(conn, …)`（在调用方事务里幂等刷新 `wiki_pages`、`page_facets`、`message_facets`、`message_events`、`wiki_chunks`、`wiki_links`）；`sync_wiki` 是两者组合 |
@@ -53,7 +53,7 @@
 ## Dreaming Agent 流程
 
 1. `list_dirty_users()` 取脏租户，`try_advisory_lock("percolation:dream:<uid>")` 防重入，拿不到锁返回 `locked`。`reindex` 用同一把锁。
-2. `prepare_workspace`：清理超过 10 分钟的 `index.lock`；`users.workspace_head` 领先主工作区时补快进（上次发布在快进前中断），并删掉已并入主线的 `dream/*` 残留分支；主工作区领先 `workspace_head`（人工提交过）或有未提交改动，就先计算同步计划再提交并同步索引登记新的 `workspace_head`（若发布失败自动 mixed reset 撤回提交，不留孤立版本）。两者分叉、登记的提交已不存在、或补快进被冲突的未提交文件挡住时报错（冲突文件会原样保留并给出 `git stash -u` 恢复指引），需要人工处理。之后主工作区干净、HEAD 等于 `workspace_head`、派生表与 HEAD 一致。
+2. `prepare_workspace`：清理超过 90 秒的残留 `index.lock`（兼容主仓库与 worktree）；`users.workspace_head` 领先主工作区时补快进（上次发布在快进前中断），并删掉已并入主线的 `dream/*` 残留分支；主工作区领先 `workspace_head`（人工提交过）或有未提交改动，就先计算同步计划再提交并同步索引登记新的 `workspace_head`（若发布失败自动 mixed reset 撤回提交，不留孤立版本）。两者分叉、登记的提交已不存在、或补快进被冲突的未提交文件挡住时报错（冲突文件会原样保留并给出 `git stash -u` 恢复指引），需要人工处理。之后主工作区干净、HEAD 等于 `workspace_head`、派生表与 HEAD 一致。
 3. 记执行环境锚点（见下文），时钟 `as_of` 取库时钟（复现时注入原值）。
 4. 节奏 `decide_mode(…, as_of)`：`MEMORY.md` 超过 90% 上限、悬空链接 ≥ 5、或距上次重整（或建号）≥ 7 天时为 `defrag`，否则 `incremental`；模式与理由写进锚点的 `decision`。没有待整理原话、也没有升降级需求时直接 `noop`。待整理原话只取锚点水位 `max_msg_seq` 以内的。
 5. 建暂存 worktree：`/mnt/percolation/staging/<uid>/<run_id>`（0700），分支 `dream/<run_id>`。之后所有写入都只发生在这里，检索只读主工作区与已发布索引。

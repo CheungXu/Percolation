@@ -150,12 +150,32 @@ facets:
             assert m1["msg_seq"] in by_date_strict.msg_seqs
             assert m2["msg_seq"] not in by_date_strict.msg_seqs
 
-            # 4. 异步 pending 兜底：新录入一条尚未归档的 pending 日程，查事件日期 + 关键词时不会被硬筛误杀
+            # 4. 异步 pending 兜底：新录入尚未归档的 pending 日程，无论是否与查询词字面撞词，查事件日期都不会被硬筛误杀
             m3_pending = await capture(services, user, "下周六上午带小黑打疫苗")
             by_date_with_pending = await retriever.search(
                 services, user, ["小黑", "疫苗"], date_from="2026-11-15", date_to="2026-11-15", time_field="event"
             )
             assert m3_pending["msg_seq"] in by_date_with_pending.msg_seqs
+            by_generic_schedule = await retriever.search(
+                services, user, ["这周六有什么安排", "周末日程"], date_from="2026-11-21", date_to="2026-11-21", time_field="event"
+            )
+            assert m3_pending["msg_seq"] in by_generic_schedule.msg_seqs
+
+            # 4b. 路由算偏日期且当天碰巧有别的无关已归档记录时，不会把高分词法正解删光，而是回退保留并置 date_filtered=False
+            m4_chore = await capture(services, user, "周六去超市买两瓶洗衣液")
+            ws.write_atomic(
+                "wiki/chores.md",
+                "---\ntitle: 家务采购\ntype: topic\nfacets:\n  domain: [家庭]\n---\n\n## 采购\n"
+                f"- [confirmed] 周六买两瓶洗衣液 [@2026-11-14] [#msg_{m4_chore['msg_seq']}]\n",
+            )
+            await sync_wiki(services, user, ws)
+            async with services.tx(user) as conn:
+                await conn.execute("UPDATE raw_messages SET dream_status = 'archived' WHERE msg_seq = %s", (m4_chore["msg_seq"],))
+            wrong_date_fallback = await retriever.search(
+                services, user, ["MIT 公开课"], date_from="2026-11-14", date_to="2026-11-14", time_field="event"
+            )
+            assert wrong_date_fallback.date_filtered is False
+            assert m1["msg_seq"] in wrong_date_fallback.msg_seqs
 
             # 5. 纯日期查空区间时返回空，不会把无关 pending 消息混进来
             empty_date = await retriever.search(

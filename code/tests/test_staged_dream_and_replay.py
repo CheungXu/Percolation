@@ -248,6 +248,48 @@ def test_replay_dream_preserves_requested_mode_and_summarizes_reasons(monkeypatc
     assert replay_mod.compare(base_summary, drifted)["decision_reasons"] is False
 
 
+def test_search_date_range_normalized_in_replay_compare():
+    from percolation.agents.search import SearchOutcome
+
+    outcome = SearchOutcome(search_id="s1", outcome="answered", route_path="primary_direct", answer="ok")
+    in_mem = outcome.as_dict()
+    assert in_mem["date_range"] == [None, None]
+    from_disk = json.loads(json.dumps(in_mem))
+    # 兼容旧版内存元组与落盘列表的对比
+    legacy_tuple = {**in_mem, "date_range": (None, None)}
+    s_disk = replay_mod.summarize("search", from_disk, None)
+    s_mem = replay_mod.summarize("search", legacy_tuple, None)
+    assert replay_mod.compare(s_disk, s_mem)["date_range"] is True
+
+
+def test_readonly_git_no_optional_locks_and_timeout_cleans_lock(tmp_path, monkeypatch):
+    ws = memory_fs.open_workspace(tmp_path / "ws")
+    index_file = ws.root / ".git" / "index"
+    ino_before = index_file.stat().st_ino
+    future = time.time() + 10
+    os.utime(ws.root / memory_fs.MEMORY_FILE, (future, future))
+    assert changed_files(ws) == []
+    assert git_head(ws) is not None
+    # --no-optional-locks 保证只读检查不会偷建 index.lock 重写 .git/index
+    assert index_file.stat().st_ino == ino_before
+
+    # 写 git 超时后（含主工作区与暂存 worktree），残留的 index.lock 会被立即清掉
+    staged = memory_fs.create_staging(ws, tmp_path / "staging" / "r1", "dream/r1")
+    for target in (ws.root, staged.root):
+        lock = memory_fs._git_dir(target) / "index.lock"
+        lock.write_text("locked", encoding="utf-8")
+
+        def fake_timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=1)
+
+        monkeypatch.setattr(subprocess, "run", fake_timeout)
+        with pytest.raises(subprocess.TimeoutExpired):
+            memory_fs._git(target, "status")
+        monkeypatch.undo()
+        assert not lock.exists()
+    memory_fs.remove_staging(ws, tmp_path / "staging" / "r1", "dream/r1")
+
+
 # ---- 隔离租户 + 真实数据库 ----
 
 
@@ -347,8 +389,19 @@ def test_staged_dream_publish_failure_isolation_and_reindex(monkeypatch):
                 assert acquired
                 assert await dream.reindex(services, user) is None
 
-            # 6. 人工改动：reindex 先提交并发布，workspace_head 跟上新提交
+            # 6. 人工改动：若发布事务失败，mixed reset 回退提交且保留工作树改动；正常 reindex 则提交并发布
             main_ws.write_atomic("wiki/missing-semester.md", PAGE.format(plan="周末刷完前三讲", seq=seq))
+
+            async def fail_apply(*args, **kwargs):
+                raise RuntimeError("apply 注入失败")
+
+            monkeypatch.setattr(dream, "apply_sync", fail_apply)
+            with pytest.raises(RuntimeError, match="apply 注入失败"):
+                await dream.prepare_workspace(services, user)
+            monkeypatch.undo()
+            assert git_head(main_ws) == head1
+            assert "前三讲" in main_ws.read_text("wiki/missing-semester.md")
+
             report = await dream.reindex(services, user)
             head2 = git_head(main_ws)
             assert report is not None and report.docs_rewritten == ["wiki/missing-semester.md"]
