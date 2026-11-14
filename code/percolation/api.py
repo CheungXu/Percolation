@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -34,6 +34,7 @@ log = logging.getLogger("percolation.api")
 
 WEB = load_web_settings()
 WEB_ASSETS = ("styles.css", "app.js")
+CONSOLE_ASSETS = ("styles.css", "app.js", "shared/base.css", "shared/catalog.js", "shared/engine.js", "shared/generated.js", "shared/ui.js")
 
 
 @asynccontextmanager
@@ -155,9 +156,19 @@ async def session_endpoint(request: Request, web: WebSettings = Depends(get_web)
         "privacy_url": web.privacy_url,
     }
     if not web.public:
-        return {"logged_in": True, "account": {"display_name": "本机调试", "phone": ""}, "login": login}
+        return {
+            "logged_in": True,
+            "account": {"display_name": "本机调试", "phone": ""},
+            "login": login,
+            "console": web.is_console_allowed(None),
+        }
     account = await _star_page_account(request)
-    return {"logged_in": account is not None, "account": account.public() if account else None, "login": login}
+    return {
+        "logged_in": account is not None,
+        "account": account.public() if account else None,
+        "login": login,
+        "console": account is not None and web.is_console_allowed(account.phone),
+    }
 
 
 @app.post("/v1/session/forget", status_code=204)
@@ -305,6 +316,87 @@ async def graph_endpoint(
         center=center,
         depth=depth,
         facet_filters=graph.parse_facet_specs(facet),
+    )
+
+
+# ---------- 控制台（白名单手机号） ----------
+
+
+class ConsoleDenied(Exception):
+    def __init__(self, status_code: int, message: str) -> None:
+        self.status_code = status_code
+        self.message = message
+
+
+@app.exception_handler(ConsoleDenied)
+async def _console_denied_handler(request: Request, exc: ConsoleDenied):
+    if "text/html" in (request.headers.get("accept") or ""):
+        back = "./" if request.url.path.endswith("/console") else "../"
+        html = (
+            "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>无权访问</title>"
+            "<style>body{font-family:system-ui,-apple-system,sans-serif;background:#fbfbfa;color:#1f2329;"
+            "display:grid;place-items:center;min-height:100vh;margin:0;padding:24px}"
+            ".box{max-width:360px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:24px;text-align:center}"
+            "h1{font-size:17px;margin:0 0 8px}p{font-size:14px;color:#6b7280;margin:0 0 18px}"
+            "a{display:inline-block;padding:8px 16px;border-radius:8px;background:#0f766e;color:#fff;text-decoration:none;font-size:14px}</style>"
+            f"</head><body><div class='box'><h1>{exc.message}</h1>"
+            "<p>控制台仅对白名单账号开放。</p>"
+            f"<a href='{back}'>返回拾记凝境</a></div></body></html>"
+        )
+        return HTMLResponse(html, status_code=exc.status_code, headers={"Cache-Control": "no-store"})
+    return JSONResponse({"detail": exc.message}, status_code=exc.status_code, headers={"Cache-Control": "no-store"})
+
+
+async def require_console_access(request: Request, web: WebSettings = Depends(get_web)) -> None:
+    if not web.public:
+        return
+    account = await _star_page_account(request)
+    if account is None:
+        raise ConsoleDenied(401, "请先登录后再访问控制台")
+    if not web.is_console_allowed(account.phone):
+        raise ConsoleDenied(403, "当前账号无权访问控制台")
+
+
+def _console_asset_version(web: WebSettings) -> str:
+    stamps = [(web.console_dir / name).stat().st_mtime_ns for name in CONSOLE_ASSETS if (web.console_dir / name).exists()]
+    return format(max(stamps, default=0) // 1_000_000, "x")
+
+
+@app.get("/console", include_in_schema=False, dependencies=[Depends(require_console_access)])
+async def console_redirect() -> RedirectResponse:
+    return RedirectResponse("console/", status_code=307, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/console/", include_in_schema=False, dependencies=[Depends(require_console_access)])
+async def console_index(web: WebSettings = Depends(get_web)) -> HTMLResponse:
+    index_file = web.console_dir / "index.html"
+    if not index_file.is_file():
+        raise HTTPException(status_code=404, detail="控制台未就绪")
+    html = index_file.read_text(encoding="utf-8").replace("{{v}}", _console_asset_version(web))
+    return HTMLResponse(
+        html,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "same-origin",
+        },
+    )
+
+
+@app.get("/console/{asset_path:path}", include_in_schema=False, dependencies=[Depends(require_console_access)])
+async def console_asset(asset_path: str, web: WebSettings = Depends(get_web)) -> FileResponse:
+    root = web.console_dir.resolve()
+    target = (root / asset_path).resolve()
+    if not target.is_relative_to(root) or not target.is_file():
+        raise HTTPException(status_code=404, detail="Not Found")
+    return FileResponse(
+        target,
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

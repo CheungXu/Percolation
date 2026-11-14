@@ -11,6 +11,20 @@ from percolation.config import REPO_ROOT
 AUTH_MODES = ("star_page", "header")
 
 
+def normalize_phone(phone: str | None) -> str:
+    digits = "".join(ch for ch in (phone or "").strip() if ch.isdigit())
+    if len(digits) == 13 and digits.startswith("86"):
+        return digits[2:]
+    return digits
+
+
+def parse_phone_whitelist(raw: str | None) -> frozenset[str]:
+    if not raw:
+        return frozenset()
+    items = (normalize_phone(part) for part in raw.replace(";", ",").replace("\n", ",").split(","))
+    return frozenset(p for p in items if p)
+
+
 @dataclass(frozen=True)
 class WebSettings:
     auth_mode: str
@@ -22,10 +36,18 @@ class WebSettings:
     daily_ask_limit: int
     daily_capture_limit: int
     web_dir: Path
+    console_dir: Path
+    console_phone_whitelist: frozenset[str]
 
     @property
     def public(self) -> bool:
         return self.auth_mode == "star_page"
+
+    def is_console_allowed(self, phone: str | None) -> bool:
+        if not self.public:
+            return True
+        normalized = normalize_phone(phone)
+        return bool(normalized) and normalized in self.console_phone_whitelist
 
 
 def load_web_settings(root: Path | None = None) -> WebSettings:
@@ -44,4 +66,6 @@ def load_web_settings(root: Path | None = None) -> WebSettings:
         daily_ask_limit=int(env.get("DAILY_ASK_LIMIT", "200")),
         daily_capture_limit=int(env.get("DAILY_CAPTURE_LIMIT", "1000")),
         web_dir=Path(env.get("WEB_DIR") or root / "code" / "web"),
+        console_dir=Path(env.get("CONSOLE_DIR") or root / "code" / "console"),
+        console_phone_whitelist=parse_phone_whitelist(env.get("CONSOLE_PHONE_WHITELIST")),
     )

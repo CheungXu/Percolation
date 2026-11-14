@@ -125,7 +125,7 @@ cd code && AUTH_MODE=header .venv/bin/uvicorn percolation.api:app --host 127.0.0
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /v1/session` | 不要求登录：`logged_in`、脱敏账号、登录方式与协议版本 |
+| `GET /v1/session` | 不要求登录：`logged_in`、脱敏账号、登录方式与协议版本、`console`（是否有控制台权限） |
 | `POST /v1/session/forget` | 网页退出登录前调用，清掉本进程对该 cookie 的缓存 |
 | `POST /v1/capture` | 录入，返回 `msg_seq` 等，另带 `note`（网页展示用） |
 | `POST /v1/search` | 检索，返回 `SearchOutcome`，另带 `step`（网页线程的一步：回答、追问、依据序号、依据主题页标题） |
@@ -137,6 +137,7 @@ cd code && AUTH_MODE=header .venv/bin/uvicorn percolation.api:app --host 127.0.0
 | `POST /v1/dream` | 手动整理当前租户，仅调试模式可用 |
 | `GET /v1/graph`、`/v1/facets` | 异构拓扑图、维度总览（参数见 `api.py`） |
 | `GET /healthz` | 数据库连通性 |
+| `GET /console/*` | Percolation 控制台页面与静态资源（见 `code/console/README.md`）；线上仅 `CONSOLE_PHONE_WHITELIST` 白名单手机号可见（未登录 401 / 非白名单 403） |
 
 每个账号滚动 24 小时内询问（含澄清重查）默认 200 次、记录 1000 条，超出回 429（`DAILY_ASK_LIMIT` / `DAILY_CAPTURE_LIMIT`，0 为不限）。检索或澄清内部出错时回 502，详情只进服务日志（`journalctl -u percolation-api`）。
 

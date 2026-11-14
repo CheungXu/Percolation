@@ -610,6 +610,7 @@
       "</div>" +
       (a.phone ? '<div class="acc-phone">' + esc(a.phone) + "</div>" : "") +
       '<p class="acc-note">与星页账号通用，你的记录只有你自己能看到。</p>' +
+      (S.console ? '<a class="acc-item acc-link" href="console/" target="_blank" rel="noopener">打开控制台</a>' : "") +
       (canLogout ? '<button class="acc-item" data-act="logout">退出登录</button>' : "") +
       "</div>"
     );
@@ -758,6 +759,7 @@
       const session = await api("v1/session", { quiet401: true });
       if (!session.logged_in) throw new ApiError("登录没有生效，请刷新页面再试", 0);
       S.account = session.account;
+      S.console = Boolean(session.console);
       hideLogin();
       await loadAll();
       if (!isMobile()) el.capIn.focus({ preventScroll: true });
@@ -785,7 +787,7 @@
     draft.set("ask", "");
     el.capIn.value = "";
     el.askIn.value = "";
-    Object.assign(S, { ready: false, account: null, notes: [], notesTotal: 0, threads: [], ctx: null, ctxAt: 0 });
+    Object.assign(S, { ready: false, account: null, console: false, notes: [], notesTotal: 0, threads: [], ctx: null, ctxAt: 0 });
     ui.recallSeqs = [];
     paintAll();
     showLogin();
@@ -1318,6 +1320,7 @@
       return;
     }
     S.account = session.account;
+    S.console = Boolean(session.console);
     try {
       await loadAll();
     } catch (err) {

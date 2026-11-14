@@ -23,7 +23,7 @@ from percolation.product.identity import (
     StarPageAuth,
     parse_account,
 )
-from percolation.product.settings import load_web_settings
+from percolation.product.settings import load_web_settings, normalize_phone, parse_phone_whitelist
 from percolation.services import Services
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -274,6 +274,95 @@ def test_api_star_page_mode_end_to_end():
     finally:
         if user_id:
             asyncio.run(_drop_external_tenant(user_id))
+
+
+def test_console_phone_whitelist_matching():
+    assert normalize_phone(" 138-0000-1234 ") == "13800001234"
+    assert normalize_phone("+86 13800001234") == "13800001234"
+    assert normalize_phone("8613800001234") == "13800001234"
+    assert normalize_phone("") == ""
+
+    wl = parse_phone_whitelist("13800001234, +86 13900005678; ")
+    assert wl == frozenset({"13800001234", "13900005678"})
+    assert parse_phone_whitelist("") == frozenset()
+
+    base = load_web_settings()
+    pub = base.__class__(**{**base.__dict__, "auth_mode": "star_page", "console_phone_whitelist": wl})
+    assert pub.is_console_allowed("13800001234") is True
+    assert pub.is_console_allowed("+8613900005678") is True
+    assert pub.is_console_allowed("13700009999") is False
+    assert pub.is_console_allowed("") is False
+    assert pub.is_console_allowed(None) is False
+
+    empty_wl = base.__class__(**{**base.__dict__, "auth_mode": "star_page", "console_phone_whitelist": frozenset()})
+    assert empty_wl.is_console_allowed("13800001234") is False
+
+    dbg = base.__class__(**{**base.__dict__, "auth_mode": "header", "console_phone_whitelist": frozenset()})
+    assert dbg.is_console_allowed(None) is True
+
+
+class _MultiStubAuth:
+    def __init__(self, accounts: dict[str, Account]) -> None:
+        self._accounts = accounts
+
+    async def account(self, token):
+        return self._accounts.get(token)
+
+    def forget(self, token):
+        pass
+
+    async def aclose(self):
+        pass
+
+
+@needs_db
+def test_console_whitelist_access_control():
+    from fastapi.testclient import TestClient
+
+    from percolation import api
+
+    if not api.WEB.public:
+        pytest.skip("config/web.env 不是 star_page 模式")
+
+    allowed = Account(id=str(uuid.uuid4()), display_name="管理员", phone="13800001111")
+    blocked = Account(id=str(uuid.uuid4()), display_name="普通用户", phone="13900002222")
+    orig_web = api.WEB
+    patched_web = orig_web.__class__(
+        **{**orig_web.__dict__, "console_phone_whitelist": frozenset({"13800001111"})}
+    )
+    try:
+        with TestClient(api.app) as client:
+            client.app.state.web = patched_web
+            client.app.state.auth = _MultiStubAuth({"admin": allowed, "user": blocked})
+
+            # 未登录：/v1/session console=False，控制台全部 401
+            assert client.get("/v1/session").json()["console"] is False
+            assert client.get("/console", follow_redirects=False).status_code == 401
+            assert client.get("/console/").status_code == 401
+            assert client.get("/console/app.js").status_code == 401
+            assert client.get("/console/shared/generated.js").status_code == 401
+
+            # 非白名单手机号：/v1/session console=False，控制台全部 403
+            client.cookies.set(patched_web.session_cookie, "user")
+            assert client.get("/v1/session").json()["console"] is False
+            assert client.get("/console", follow_redirects=False).status_code == 403
+            html_denied = client.get("/console/", headers={"Accept": "text/html"})
+            assert html_denied.status_code == 403 and "无权访问" in html_denied.text
+            assert client.get("/console/app.js").status_code == 403
+            assert client.get("/console/shared/generated.js").status_code == 403
+
+            # 白名单手机号：/v1/session console=True，控制台可访问，且路径穿越被拦截
+            client.cookies.set(patched_web.session_cookie, "admin")
+            assert client.get("/v1/session").json()["console"] is True
+            redir = client.get("/console", follow_redirects=False)
+            assert redir.status_code == 307 and redir.headers["location"] == "console/"
+            idx = client.get("/console/")
+            assert idx.status_code == 200 and "{{v}}" not in idx.text and "shared/generated.js?v=" in idx.text
+            assert client.get("/console/app.js").status_code == 200
+            assert client.get("/console/shared/generated.js").status_code == 200
+            assert client.get("/console/../web/app.js").status_code == 404
+    finally:
+        pass
 
 
 async def _drop_external_tenant(user_id: str) -> None:

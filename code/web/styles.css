@@ -326,6 +326,14 @@ textarea {
   background: #eceef2;
 }
 
+.acc-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  margin-bottom: 8px;
+}
+
 /* ───────── 双工作区 ───────── */
 .split {
   flex: 1;
