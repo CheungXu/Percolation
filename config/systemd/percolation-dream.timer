@@ -1,4 +1,4 @@
-# 模板，尚未启用。启用：
+# 已启用。安装 / 更新：
 #   cp config/systemd/percolation-dream.{service,timer} /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now percolation-dream.timer
 [Unit]

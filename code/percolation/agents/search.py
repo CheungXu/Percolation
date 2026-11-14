@@ -123,6 +123,7 @@ class SearchOutcome:
     usage: dict = field(default_factory=dict)
     cost_cny: float = 0.0
     trace_id: str = ""
+    parent_search_id: str | None = None
 
     def as_dict(self) -> dict:
         data = asdict(self)
@@ -209,8 +210,9 @@ async def ask(
     *,
     clarification: str | None = None,
     as_of: datetime | None = None,
+    parent_search_id: str | None = None,
 ) -> SearchOutcome:
-    """as_of 只在复现时传：把「当前日期」钉在原运行的时刻。"""
+    """as_of 只在复现时传：把「当前日期」钉在原运行的时刻。parent_search_id 是澄清重查所属线程的第一问。"""
     trace = services.new_trace("search", user, clarification=bool(clarification))
     trace.root.payload["input"] = {"query": query, "clarification": clarification}
     try:
@@ -221,7 +223,14 @@ async def ask(
                 anchor = await services.capture_env(user, ws, as_of=as_of, check_clean=True)
             env_anchor.attach(trace, anchor)
             result = await _ask(
-                services, user, trace, query, clarification, ws=ws, as_of=datetime.fromisoformat(anchor["db"]["as_of"])
+                services,
+                user,
+                trace,
+                query,
+                clarification,
+                ws=ws,
+                as_of=datetime.fromisoformat(anchor["db"]["as_of"]),
+                parent_search_id=parent_search_id,
             )
     except Exception as exc:
         error = f"{type(exc).__name__}: {services.models.redact(str(exc))}"[:2000]
@@ -246,6 +255,7 @@ async def _ask(
     *,
     ws: Workspace,
     as_of: datetime,
+    parent_search_id: str | None = None,
 ) -> SearchOutcome:
     started = time.monotonic()
     ctx = services.context(user, trace, ws)
@@ -330,6 +340,7 @@ async def _ask(
     else:
         outcome, answer = "not_found", draft.answer or "没有找到相关记录。"
 
+    clarify_question = draft.clarify_question if outcome == "clarify_asked" else ""
     latency_ms = int((time.monotonic() - started) * 1000)
     async with services.tx(user) as conn:
         existing = await (
@@ -341,14 +352,15 @@ async def _ask(
                 """
                 INSERT INTO search_logs (
                   user_id, query_text, route_path, outcome, rewritten_queries, memory_clues_used,
-                  cache_files_probed, cache_hit_entries, hit_doc_paths, verified_msg_seqs, latency_ms, token_usage
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb)
+                  cache_files_probed, cache_hit_entries, hit_doc_paths, verified_msg_seqs, latency_ms, token_usage,
+                  answer_text, clarify_question, parent_search_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s)
                 RETURNING id::text AS id
                 """,
                 (
                     user.id, query, route_path, outcome, queries[1:], memory_clues, cache_files,
                     json.dumps(cache_hits, ensure_ascii=False), draft.hit_doc_paths, verified, latency_ms,
-                    json.dumps(trace.usage.as_dict()),
+                    json.dumps(trace.usage.as_dict()), answer or "", clarify_question, parent_search_id,
                 ),
             )
         ).fetchone()
@@ -366,7 +378,7 @@ async def _ask(
         outcome=outcome,
         route_path=route_path,
         answer=answer,
-        clarify_question=draft.clarify_question if outcome == "clarify_asked" else "",
+        clarify_question=clarify_question,
         verified_msg_seqs=verified,
         hit_doc_paths=draft.hit_doc_paths,
         queries=queries,
@@ -377,17 +389,24 @@ async def _ask(
         usage=trace.usage.as_dict(),
         cost_cny=round(trace.cost, 6),
         trace_id=trace.trace_id,
+        parent_search_id=parent_search_id,
     )
     return result
 
 
 async def clarify(services: Services, user: UserRef, search_id: str, content: str) -> tuple[dict, SearchOutcome]:
-    """用户回复追问：作为高优澄清原话入库，再用原问题重新检索一次。"""
+    """用户回复追问：作为高优澄清原话入库，再用原问题重新检索一次。重查挂在线程第一问下面。"""
     from percolation.capture import capture
 
     async with services.tx(user) as conn:
-        row = await (await conn.execute("SELECT query_text FROM search_logs WHERE id = %s", (search_id,))).fetchone()
+        row = await (
+            await conn.execute(
+                "SELECT query_text, COALESCE(parent_search_id, id)::text AS root_id FROM search_logs WHERE id = %s",
+                (search_id,),
+            )
+        ).fetchone()
     if row is None:
         raise LookupError(f"检索记录不存在：{search_id}")
     captured = await capture(services, user, content, source_kind="clarification", reply_to_search_id=search_id)
-    return captured, await ask(services, user, row["query_text"], clarification=content)
+    outcome = await ask(services, user, row["query_text"], clarification=content, parent_search_id=row["root_id"])
+    return captured, outcome

@@ -11,3 +11,6 @@
 - `backfill_workspace_head.py [--dry-run]`：迁移 004 之后的一次性回填，把每个租户 `users.workspace_head` 设成工作区当前 HEAD（建表账号，只填 NULL）。
 - `phoenix.sh`：Arize Phoenix 单容器运维。`init-db`（用相邻项目管理账号建独立库/角色 `percolation_obs`，生成 `config/phoenix.env`）、`up`、`down`、`status`、`logs`。容器走 host 网络、只监听 127.0.0.1:6006/4317、开启认证、内存上限 1G。本地查看：`ssh -L 6006:127.0.0.1:6006 <server>` 后打开 `http://127.0.0.1:6006`，账号 `admin@localhost`，初始密码在 `config/phoenix.env`（首次登录要求修改）。
 - `e2e_percolation.py`：端到端验收。用建表账号临时建 `e2e-<时间戳>` 租户，跑录入直查、增量整理、候选区穿透与晋升（人工编辑经 reindex 发布）、追问澄清、多维正交归档检索与异构拓扑图及 RLS 隔离、整理期间并发检索与发布失败隔离、按锚点复现三类运行共七个场景，逐项打印 PASS/FAIL，结束后清理（轨迹保留）。`--keep` 保留数据便于查看，`--drop <slug>` 单独清理 `e2e-`/`replay-` 租户。会真实调用模型。
+- `preview-console/`：内部管理控制台前端预览（监听 `3001`–`3004`，已选定 `3004` 融合版），展示整体架构、AgentSpec 配置、上下文管理与调试台。
+- `qa_web.mjs`：拾记凝境网页走查（Node + Playwright）。完整流程（空状态、连记、光点、Tab 伸缩、边问边浮现、思考态、作答、追问补一句、依据定位、近况、刷新还原、移动端滑动与边签）对本机调试服务 + `e2e-` 临时租户跑，会真实调用检索模型；`--login-only` 检查未登录的登录卡；`--showcase` 拍已整理租户的近况卡片；`--smoke` 带星页 cookie 冒烟线上。截图到 `images/product-web/`，用法见脚本开头注释和 `code/web/README.md`。
+- 拾记凝境界面的五套风格预览已移到 `alternatives/product-ui/`（方案 2 已上线为 `code/web/`）。

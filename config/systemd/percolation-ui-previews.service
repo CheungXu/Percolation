@@ -1,0 +1,19 @@
+# 拾记凝境界面备选方案预览（已启用），代码在 alternatives/product-ui/。
+# 监听 3011..3015，经 Nginx snippets/ningjing-previews.conf 挂在 IP 直连的 http://<ip>/ningjing/ 下。
+# 安装 / 更新：
+#   cp config/systemd/percolation-ui-previews.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now percolation-ui-previews.service
+# 不再需要时：systemctl disable --now percolation-ui-previews.service
+[Unit]
+Description=拾记凝境 · UI alternatives previews (3011-3015)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Percolation
+ExecStart=/usr/bin/python3 -u alternatives/product-ui/serve.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,5 @@
-# 模板，尚未启用。由 percolation-dream.timer 每晚触发，处理全部脏租户。
+# 已启用。由 percolation-dream.timer 每晚触发，处理全部脏租户（含网页端自动开的 sp-<uuid> 租户）。
+# 手动补跑：systemctl start percolation-dream.service；日志：journalctl -u percolation-dream
 [Unit]
 Description=Percolation nightly dreaming
 After=network-online.target remote-fs.target

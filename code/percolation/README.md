@@ -24,7 +24,10 @@
 | `agents/dream.py` | Dreaming Agent，`run_for_user(mode, as_of)`、`run_dirty_queue()`、`reindex()`、`prepare_workspace()` |
 | `prompts/*.md` | 五个节点的系统提示词 |
 | `skills/wiki-format/SKILL.md` | 记忆文件写法规范，整理节点按需读取 |
-| `api.py` | FastAPI 接口 |
+| `api.py` | FastAPI 接口，同时托管 `code/web/` 网页（拾记凝境） |
+| `product/settings.py` | 网页端配置 `config/web.env`：鉴权模式、星页接口地址、协议版本、每日限额、静态目录 |
+| `product/identity.py` | 星页登录态识别 `StarPageAuth`：把 `sp_session` cookie 转给星页 `/api/auth/me` 换账号，进程内缓存 60 秒（未登录缓存 5 秒）；星页连不上抛 `AuthUnavailable`（接口回 503，与未登录 401 区分） |
+| `product/views.py` | 网页读模型：记录分页、问答线程组装（第一问 + 澄清重查 + 用户补充）、边问边浮现的词面召回、近况（`MEMORY.md` 分组 + 最近主题页摘要）、24 小时用量 |
 
 ## 每个节点的权限
 
@@ -46,7 +49,7 @@
 3. 答不上且候选区有文件：`search_cache_probe` 在沙箱里 `ls`/`rg` 候选区，找到映射就改写检索词再走一次第 2 步，`route_path = cache_fallback`。答上时累加 `users.pending_cache_hits` 并置脏标记。
 4. 仍答不上：有歧义或未知暗语时输出一句追问（`clarify_asked`），否则 `not_found`。用户回复追问走 `clarify()`：作为 `clarification` 原话入库，再用原问题重查。
 
-每次检索写一条 `search_logs`，完整轨迹写进 NAS 轨迹仓（见下文“轨迹”）。
+每次检索写一条 `search_logs`（含给用户看的回答 `answer_text`、追问 `clarify_question`，澄清重查带 `parent_search_id`），完整轨迹写进 NAS 轨迹仓（见下文“轨迹”）。
 
 召回细节：wiki 切片走全文（OR 语义的重叠二字 tsquery，标题别名权重 A、小节与维度词元权重 B、正文 C）、trgm/子串、向量，以及**第四路正交维度与事件日期召回**（按 `page_facets` 命中维度数排序 + `message_events` 区间匹配），RRF（k=60）融合；原话走全文、trgm、子串、原话级维度/日期命中，另把最近 60 条 pending 原话全部放进候选。合并后最多 40 条交给 `gte-rerank-v2`，取前 6。最后沿 `wiki_links` 补带 `rel_type` 与页面维度的一跳邻居页。库里还没有切片时不调向量接口。
 
@@ -104,11 +107,37 @@ code/.venv/bin/python script/percolation_cli.py ask "之前想买的便携屏多
 code/.venv/bin/python script/percolation_cli.py dream
 code/.venv/bin/python script/percolation_cli.py graph --facet domain=学习 --json
 code/.venv/bin/python script/percolation_cli.py facets
-cd code && .venv/bin/uvicorn percolation.api:app --host 127.0.0.1 --port 8710
+cd code && AUTH_MODE=header .venv/bin/uvicorn percolation.api:app --host 127.0.0.1 --port 8711   # 本机调试；线上 8710 由 systemd 常驻
 ```
 
-HTTP 接口：`POST /v1/capture`、`/v1/search`、`/v1/clarify`、`/v1/dream`，`GET /v1/graph`、`/v1/facets`、`/healthz`。请求头 `X-User-Slug` 选租户，缺省为默认用户。
-
-端到端验收：`code/.venv/bin/python script/e2e_percolation.py`，会临时建一个 `e2e-<时间戳>` 租户并在结束后清理。
+端到端验收：`code/.venv/bin/python script/e2e_percolation.py`，会临时建一个 `e2e-<时间戳>` 租户并在结束后清理。网页走查：`script/qa_web.mjs`（见 `code/web/README.md`）。
 
 `percolation_cli.py reindex` 走 `dream.reindex()`：与整理同锁，先提交并发布人工改动，再按主工作区文件重建派生表。手工改了工作区文件后用它发布，否则检索读到的是未提交文件、复现只能拿到上一次提交。
+
+## HTTP 接口与网页
+
+常驻服务 `percolation-api.service`（`127.0.0.1:8710`，2 个 worker），线上地址 <https://stars-page.com/Percolation/>（Nginx 去前缀转发）。`GET /` 是网页，前端说明见 `code/web/README.md`。
+
+鉴权由 `config/web.env` 的 `AUTH_MODE` 决定：
+
+- `star_page`（线上默认）：读星页同域 cookie `sp_session`，向星页 `/api/auth/me` 换账号，首次访问经受控函数 `provision_user` 开租户 `sp-<星页 user uuid>`（迁移 005）。`X-User-Slug` 不生效；`/v1/dream` 返回 403（整理只由夜间定时器跑）；`/docs`、`/openapi.json` 关闭。
+- `header`（本机调试）：请求头 `X-User-Slug` 选租户，缺省为默认用户。只能监听 127.0.0.1，例如 `AUTH_MODE=header uvicorn ... --port 8711`。
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /v1/session` | 不要求登录：`logged_in`、脱敏账号、登录方式与协议版本 |
+| `POST /v1/session/forget` | 网页退出登录前调用，清掉本进程对该 cookie 的缓存 |
+| `POST /v1/capture` | 录入，返回 `msg_seq` 等，另带 `note`（网页展示用） |
+| `POST /v1/search` | 检索，返回 `SearchOutcome`，另带 `step`（网页线程的一步：回答、追问、依据序号、依据主题页标题） |
+| `POST /v1/clarify` | 回复追问：澄清原话入库 + 原问题重查（`parent_search_id` 指向线程第一问），另带 `note`、`step` |
+| `GET /v1/notes?before_seq=&limit=` | 记录分页（正序返回，首页带 `total`） |
+| `GET /v1/threads?before_id=&limit=` | 问答线程分页（按第一问的 uuidv7 倒序取，正序返回） |
+| `GET /v1/recall?q=` | 边问边浮现：只做词面匹配（去掉虚词后的二字组与英文数字词，在最近 3000 条原话里数命中），不调模型 |
+| `GET /v1/context` | 近况：`MEMORY.md` 分组、最近 8 个主题页的已确认条目、记录数 / 待整理数 / 上次整理时间 |
+| `POST /v1/dream` | 手动整理当前租户，仅调试模式可用 |
+| `GET /v1/graph`、`/v1/facets` | 异构拓扑图、维度总览（参数见 `api.py`） |
+| `GET /healthz` | 数据库连通性 |
+
+每个账号滚动 24 小时内询问（含澄清重查）默认 200 次、记录 1000 条，超出回 429（`DAILY_ASK_LIMIT` / `DAILY_CAPTURE_LIMIT`，0 为不限）。检索或澄清内部出错时回 502，详情只进服务日志（`journalctl -u percolation-api`）。
+
+改了 `code/percolation` 或 `config/*.env` 后 `systemctl restart percolation-api`（重启期间约 3 秒不可用，正在进行的询问会中断）；只改 `code/web` 不用重启。

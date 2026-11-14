@@ -1,15 +1,18 @@
-# 模板，尚未启用。启用：
+# 拾记凝境网页与接口（已启用）。https://stars-page.com/Percolation/ 经 Nginx snippets/percolation.conf 转到这里。
+# 安装 / 更新：
 #   cp config/systemd/percolation-api.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now percolation-api.service
+# 改了 code/percolation 或 config/*.env 后 systemctl restart percolation-api；只改 code/web 静态文件不用重启。
 [Unit]
-Description=Percolation search and capture API
+Description=拾记凝境 · Percolation web & API (127.0.0.1:8710)
 After=network-online.target remote-fs.target
 Requires=remote-fs.target
 
 [Service]
 Type=simple
 WorkingDirectory=/root/Percolation/code
-ExecStart=/root/Percolation/code/.venv/bin/uvicorn percolation.api:app --host 127.0.0.1 --port 8710
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/Percolation/code/.venv/bin/uvicorn percolation.api:app --host 127.0.0.1 --port 8710 --workers 2 --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-server-header
 Restart=on-failure
 RestartSec=5
 

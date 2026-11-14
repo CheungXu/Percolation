@@ -61,6 +61,12 @@ class Services:
             raise LookupError(f"用户不存在：{slug}")
         return UserRef(id=str(row["user_id"]), slug=row["external_slug"], workspace_rel_path=row["workspace_rel_path"])
 
+    async def provision_user(self, slug: str) -> UserRef:
+        """外部账号（sp-<uuid>）首次访问时建租户，已存在则直接返回。只走受控函数 provision_user。"""
+        async with self.pool.connection() as conn:
+            row = await (await conn.execute("SELECT * FROM provision_user(%s)", (slug,))).fetchone()
+        return UserRef(id=str(row["user_id"]), slug=row["external_slug"], workspace_rel_path=row["workspace_rel_path"])
+
     def workspace(self, user: UserRef) -> Workspace:
         return open_workspace(self.settings.nas_root / user.workspace_rel_path)
 

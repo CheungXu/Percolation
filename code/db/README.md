@@ -34,9 +34,18 @@ SELECT capture_message('随手记的一句话');
 
 存量用户回填：`code/.venv/bin/python script/backfill_workspace_head.py [--dry-run]`（建表账号，只填 NULL，可重复）。整理和 reindex 开头也会懒回填。
 
+## 网页端（005）
+
+`005_product_web.sql` 为拾记凝境网页补两件事：
+
+- `search_logs` 加 `answer_text`、`clarify_question`、`parent_search_id`。前两列存给用户看的回答和追问，网页刷新后能还原问答历史；澄清后的重查用 `parent_search_id` 指向线程第一问（第一问自身为 NULL），用户补的那句话仍是 `raw_messages.reply_to_search_id` 指向被回复的那一步。旧行默认空串 / NULL。
+- `provision_user(p_slug)`（`SECURITY DEFINER`）：星页登录用户首次访问时建租户，slug 固定为 `sp-<星页 user uuid>`，已存在就直接返回，`created` 列标明是否新建。运行角色没有 `users` 的 INSERT 权限，只能经由这个函数；它拒绝 `sp-<uuid>` 以外的 slug，不能用来建 `default`、`e2e-`、`replay-` 等内部租户。
+
+`sp-` 租户不在 `tenants.drop_tenant` 的允许范围内。确需删除（如测试账号）时，用建表账号按「临时租户」一节的同样步骤手工删，删完要 `systemctl restart percolation-api`：接口进程里缓存了 slug 到租户 id 的映射。
+
 ## 执行记录
 
-`000_extensions.sql`、`001_init.sql`、`002_dream_queue.sql` 已在 2026-11-12 执行；`003_wiki_facets_and_graph.sql`（多维节点/维度倒排/事件日期/类型链接边与强制 RLS）、`004_workspace_head.sql` 已在 2026-11-13 执行（幂等脚本），`004` 之后已回填全部 2 个用户。`001` 不要重复执行。
+`000_extensions.sql`、`001_init.sql`、`002_dream_queue.sql` 已在 2026-11-12 执行；`003_wiki_facets_and_graph.sql`（多维节点/维度倒排/事件日期/类型链接边与强制 RLS）、`004_workspace_head.sql` 已在 2026-11-13 执行（幂等脚本），`004` 之后已回填全部 2 个用户。`005_product_web.sql` 已在 2026-11-15 执行（幂等）。`001` 不要重复执行。
 
 ## 临时租户
 
@@ -44,4 +53,6 @@ SELECT capture_message('随手记的一句话');
 
 复现建 replay 租户时，建表账号凭 `owner_maintenance` 策略跨租户读原租户的三张事实表，直接 `INSERT` 原话（保留 `msg_seq`、`batch_id`、`captured_at`，不走 `capture_message`），并改写 `next_msg_seq`、计数和 `created_at`。这些写法只用于 `replay-` 租户。
 
-临时校验过两件事，测试数据都已回滚或删除：不设置租户时运行角色看不见行；两个租户互相看不见对方的检索记录。库里现在只有 `default` 这一个用户，没有消息。
+临时校验过两件事，测试数据都已回滚或删除：不设置租户时运行角色看不见行；两个租户互相看不见对方的检索记录。
+
+2026-11-15 网页端上线后，真实用户以 `sp-<uuid>` 租户出现；`default` 仍保留给命令行和本机调试。

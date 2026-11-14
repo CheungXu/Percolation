@@ -11,6 +11,8 @@
 - `agent-observability-and-trace-store.md`：Agent 可观测性落地方案。自建文件轨迹仓作真相源（span 树、线性存储 messages、工具原文双份、CAS 去重、版本指纹、DuckDB 查询）+ OTLP 派生面板（OpenInference/GenAI 属性映射、历史回放），Phoenix 自托管踩坑与内核级预算/死循环/成本护栏。
 - `agent-execution-env-reproduction.md`：Agent 执行环境追溯与复现。暂存 worktree 写入 + plan/apply 拆分的单事务发布 + 快进（并发读不到半成品、失败零补偿）、根 span 执行环境锚点（工作区版本/库水位/代码依赖配置指纹/决策）、`as_of` 时钟注入、回放租户重建现场与 `side_effect` 护栏、N 次稳定性对比，以及轨迹清理的 blob 标记-清扫与索引锁。
 - `aliyun-swas-nas-mount.md`：轻量应用服务器挂载阿里云通用型 NAS 的做法。核心是避开与默认专有网络重叠的 `172.16.0.0/12`，另建网段后做内网互通；并用 TCP 2049 而不是 ping 判断连通性。
+- `dual-workspace-ui-patterns.md`：双工作区界面模式。桌面焦点驱动的 `flex-grow` 主次伸缩、移动端卡片滑动 + 边缘露出边签、单一滚动进度变量驱动全部过渡；`scroll-snap` 遇 `transform` 偏移、切换时保持键盘不收起、iOS 可视高度与 16px 字号等踩坑；接真实后端后的外壳只挂载一次 + 局部重绘、乐观插入、进度叙事式等待态与边输入边联想的词面召回门槛。
+- `subpath-app-with-shared-login.md`：在已有站点的同域子路径挂新产品并复用主站登录。Nginx 去前缀与尾斜杠跳转、相对路径约定、转发 cookie 到主站 `/me` 换账号（缓存、401 与 503 区分、退出顺序）、`SECURITY DEFINER` 受控开户、公网模式关闭调试入口，以及临时会话验收与配置归属等踩坑。
 - `aliyun-rds-pg-multitenant-and-hybrid-search.md`：共享阿里云 RDS PostgreSQL 实例构建多租户与混合检索库的实战指南。涵盖双角色拆分规避 `rolbypassrls` 静默失效、`ENABLE + FORCE RLS` 策略配对、只追加事实表防护，以及免重启实例的中文重叠二字 `tsvector` + `pg_trgm` + `halfvec(1024)` 方案。
 
 ---
