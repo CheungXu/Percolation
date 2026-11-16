@@ -131,6 +131,8 @@ cd code && AUTH_MODE=header .venv/bin/uvicorn percolation.api:app --host 127.0.0
 | `POST /v1/search` | 检索，返回 `SearchOutcome`，另带 `step`（网页线程的一步：回答、追问、依据序号、依据主题页标题） |
 | `POST /v1/clarify` | 回复追问：澄清原话入库 + 原问题重查（`parent_search_id` 指向线程第一问），另带 `note`、`step` |
 | `GET /v1/notes?before_seq=&limit=` | 记录分页（正序返回，首页带 `total`） |
+| `GET /v1/notes/search?q=` | 在记录里找原话：空格分开的词都要出现（不区分大小写）；中文整句没命中时切成记录里出现过的二字组再匹配（返回的 `terms` 即实际用的词）；最多返回最近 200 条；另用 `recall` 补最多 5 条 `near: true`（意思相近）。每条带 `pos`（在全部原话里的名次），另返回 `matched`、`total`、`capped`、`terms` |
+| `GET /v1/notes/between?after_seq=&before_seq=&edge=3` | 展开搜索结果里的一段折叠：只给紧挨两侧的各 `edge` 条（开头 / 结尾的折叠只给一侧），剩得不多就整段给；带 `pos` 和剩余条数 `hidden` |
 | `GET /v1/threads?before_id=&limit=` | 问答线程分页（按第一问的 uuidv7 倒序取，正序返回） |
 | `GET /v1/recall?q=` | 边问边浮现：只做词面匹配（去掉虚词后的二字组与英文数字词，在最近 3000 条原话里数命中），不调模型 |
 | `GET /v1/context` | 近况：`MEMORY.md` 分组、最近 8 个主题页的已确认条目、记录数 / 待整理数 / 上次整理时间 |

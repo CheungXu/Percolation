@@ -19,6 +19,8 @@
     link: '<svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M7.5 2.5L4 6l3.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     ctx: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1.4" stroke="currentColor" stroke-width="1.4"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1.4" stroke="currentColor" stroke-width="1.4"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1.4" stroke="currentColor" stroke-width="1.4"/><rect x="9" y="9" width="4.5" height="4.5" rx="1.4" stroke="currentColor" stroke-width="1.4"/></svg>',
     user: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="5.6" r="2.6" stroke="currentColor" stroke-width="1.4"/><path d="M3 13.4c.9-2.3 2.8-3.5 5-3.5s4.1 1.2 5 3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
+    find: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="7.2" cy="7.2" r="4.6" stroke="currentColor" stroke-width="1.6"/><path d="M10.6 10.6L14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+    close: '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 3l6 6M9 3L3 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
   };
 
   const MODES = {
@@ -60,6 +62,8 @@
     pagerLock: false,
     clarifyDrafts: {},
     loginShown: false,
+    find: null,
+    lastFind: "",
   };
 
   let localSeq = 0;
@@ -244,8 +248,10 @@
       sendTitle +
       '" aria-label="' +
       sendTitle +
-      '">' +
+      '"><span class="send-glyph">' +
       ICON.up +
+      "</span>" +
+      (mode === "cap" ? '<span class="send-alt">' + ICON.find + "</span>" : "") +
       "</button></div>"
     );
   }
@@ -268,11 +274,21 @@
       topbarHtml() +
       '<main class="split"><i class="edge"></i>' +
       '<section class="panel panel-left is-active" data-ws="cap">' +
-      '<div class="panel-head"><div class="panel-title"><span class="title-dot"></span>记录</div><span id="cap-meta" class="panel-meta"></span></div>' +
+      '<div class="panel-head"><div class="panel-title"><span class="title-dot"></span>记录</div>' +
+      '<button id="cap-meta" class="panel-meta find-btn" data-act="find" title="在记录里找（/）">' +
+      ICON.find +
+      '<span class="find-btn-text"></span></button>' +
+      '<div class="find-bar" role="search">' +
+      ICON.find +
+      '<input id="find-in" type="search" placeholder="在记录里找原话" maxlength="200" autocomplete="off" enterkeyhint="search" aria-label="在记录里找原话" tabindex="-1" />' +
+      '<span class="find-count" aria-live="polite"></span>' +
+      '<button class="find-close" data-act="find-close" title="收起（Esc）" aria-label="收起搜索" tabindex="-1">' +
+      ICON.close +
+      "</button></div></div>" +
       '<div id="left-stream" class="stream"></div>' +
       '<div class="dock">' +
       composerHtml("cap", "想到什么，随手记下", "记下") +
-      '<div class="dock-hint">Enter 记下 · Tab 去询问</div></div>' +
+      '<div class="dock-hint">Enter 记下 · Tab 去询问 · / 找记录</div></div>' +
       peekHtml("cap", "记录") +
       "</section>" +
       '<section class="panel panel-right is-idle" data-ws="ask">' +
@@ -298,11 +314,15 @@
       capIn: document.getElementById("cap-in"),
       askIn: document.getElementById("ask-in"),
       capMeta: document.getElementById("cap-meta"),
+      capMetaText: $("#cap-meta .find-btn-text"),
+      findIn: document.getElementById("find-in"),
+      findCount: $(".find-count"),
       menuLayer: $(".menu-layer"),
       loginLayer: $(".login-layer"),
       toast: $(".toast"),
     };
     wireInputs();
+    wireFind();
     wirePager();
     wireStreams();
   }
@@ -320,27 +340,60 @@
     );
   }
 
-  function noteHtml(n) {
+  // 把命中的词包进 <mark>；重叠的区间合并，避免标签交错
+  function markTerms(text, terms) {
+    if (!terms || !terms.length) return esc(text);
+    const lower = text.toLowerCase();
+    const spans = [];
+    for (const t of terms) {
+      for (let i = lower.indexOf(t); i !== -1; i = lower.indexOf(t, i + t.length)) spans.push([i, i + t.length]);
+    }
+    if (!spans.length) return esc(text);
+    spans.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const sp of spans) {
+      const last = merged[merged.length - 1];
+      if (last && sp[0] <= last[1]) last[1] = Math.max(last[1], sp[1]);
+      else merged.push(sp.slice());
+    }
+    let html = "";
+    let at = 0;
+    for (const [s, e] of merged) {
+      html += esc(text.slice(at, s)) + "<mark>" + esc(text.slice(s, e)) + "</mark>";
+      at = e;
+    }
+    return html + esc(text.slice(at));
+  }
+
+  function noteHtml(n, terms) {
     const cls = ["note"];
     if (n.state === "sending") cls.push("sending");
     else if (n.state === "failed") cls.push("failed");
     else if (n.status === "pending") cls.push("fresh");
     if (n.seq && ui.recallSeqs.indexOf(n.seq) !== -1) cls.push("recall");
     if (n.enter) cls.push("enter");
+    if (n.hit) cls.push("hit");
+    if (n.near) cls.push("near");
+    if (n.hit === false) cls.push("ctx");
     const attr = n.seq ? ' data-note-seq="' + n.seq + '"' : ' data-note-local="' + n.local + '"';
-    const tag = n.kind === "clarification" ? '<span class="note-tag">补充</span>' : "";
+    let tag = n.kind === "clarification" ? '<span class="note-tag">补充</span>' : "";
+    if (n.near) tag += '<span class="note-tag near-tag">相近</span>';
+    const time = '<time class="note-time" title="' + (n.status === "pending" ? "今晚凝练" : "已凝练") + '">' + clock(n.at) + "</time>";
     const tail =
       n.state === "failed"
         ? '<button class="note-retry" data-retry-note="' + n.local + '">重试</button>'
-        : '<time class="note-time" title="' + (n.status === "pending" ? "今晚凝练" : "已凝练") + '">' + clock(n.at) + "</time>";
+        : n.hit
+          ? '<span class="note-side">' + time + '<span class="note-go">定位</span></span>'
+          : time;
     return (
       '<div class="' +
       cls.join(" ") +
       '"' +
       attr +
+      (n.hit ? ' data-locate="' + n.seq + '" title="定位到原处"' : "") +
       '><span class="note-dot"></span><span class="note-body">' +
       tag +
-      esc(n.content) +
+      (n.near ? esc(n.content) : markTerms(n.content, terms)) +
       "</span>" +
       tail +
       "</div>"
@@ -364,21 +417,29 @@
     return html + "</div>";
   }
 
+  // anchor：重绘前后让这条记录停在屏幕上同一位置（展开折叠时用）
   function paintNotes(opt = {}) {
     const box = el.leftStream;
     const stick = opt.bottom || nearBottom(box);
     const fromBottom = box.scrollHeight - box.scrollTop;
-    box.innerHTML = notesHtml();
-    if (opt.keepOffset) box.scrollTop = box.scrollHeight - fromBottom;
+    const anchorSel = opt.anchor ? '[data-note-seq="' + opt.anchor + '"]' : null;
+    const before = anchorSel && box.querySelector(anchorSel);
+    const anchorTop = before ? before.getBoundingClientRect().top : 0;
+    box.innerHTML = findActive() ? findHtml() : notesHtml();
+    const after = anchorSel && box.querySelector(anchorSel);
+    if (before && after) box.scrollTop += after.getBoundingClientRect().top - anchorTop;
+    else if (opt.keepOffset) box.scrollTop = box.scrollHeight - fromBottom;
     else if (stick) box.scrollTop = box.scrollHeight;
     S.notes.forEach((n) => (n.enter = false));
+    if (ui.find) ui.find.items.forEach((n) => (n.enter = false));
     paintCapMeta();
   }
 
   function paintCapMeta() {
     const n = ui.recallSeqs.length;
-    el.capMeta.textContent = n ? n + " 条相关" : S.ready && S.notesTotal ? S.notesTotal + " 条" : "";
+    el.capMetaText.textContent = n ? n + " 条相关" : S.ready && S.notesTotal ? S.notesTotal + " 条" : "";
     el.capMeta.classList.toggle("on", n > 0);
+    el.capMeta.classList.toggle("no-notes", !(S.ready && S.notesTotal));
   }
 
   function noteEl(n) {
@@ -400,7 +461,7 @@
 
   async function loadOlderNotes() {
     const before = oldestSeq();
-    if (S.notesLoading || !S.notesMore || !before) return false;
+    if (findActive() || S.notesLoading || !S.notesMore || !before) return false;
     S.notesLoading = true;
     el.leftStream.insertAdjacentHTML("afterbegin", '<div class="more"><span></span></div>');
     try {
@@ -422,6 +483,258 @@
     for (let guard = 0; guard < 20 && S.notesMore && (oldestSeq() || 0) > min; guard++) {
       if (!(await loadOlderNotes())) break;
     }
+  }
+
+  /* ───────── 在记录里找 ───────── */
+  // 结果是一条「折叠的时间线」：命中的原话按时间排开，中间没命中的收成一道可展开的折痕，
+  // 找到一句话的同时还看得到它前后发生了什么。点命中的一条，收起搜索并定位到原处。
+
+  const findActive = () => Boolean(ui.find && ui.find.q);
+
+  function newFind() {
+    return { q: "", terms: [], items: [], matched: 0, total: 0, capped: false, cur: -1, ctrl: null };
+  }
+
+  const findHits = () => (ui.find ? ui.find.items.filter((n) => n.hit) : []);
+
+  function foldHtml(prev, next, count) {
+    const label = !prev ? "更早 " + count + " 条" : !next ? "之后 " + count + " 条" : count + " 条";
+    return (
+      '<button class="fold" data-fold-after="' +
+      (prev ? prev.seq : "") +
+      '" data-fold-before="' +
+      (next ? next.seq : "") +
+      '" aria-label="展开' +
+      label +
+      '"><span class="fold-pill">' +
+      label +
+      "</span></button>"
+    );
+  }
+
+  function findFootHtml(f, hits) {
+    const lit = hits.filter((n) => !n.near).length;
+    const near = hits.length - lit;
+    let text = lit ? f.matched + " 条原话" : "没有原话包含这些字";
+    if (near) text += " · " + near + " 条意思相近";
+    if (f.capped) text += "（列出最近 " + lit + " 条）";
+    return '<div class="find-foot"><span>' + text + '</span><button class="find-ask" data-find-ask>问问 AI ›</button></div>';
+  }
+
+  function findEmptyHtml(f) {
+    return (
+      '<div class="empty find-empty"><div class="empty-mark"><i></i><i></i></div>' +
+      "<h3>没找到「" +
+      esc(f.q) +
+      "」</h3><p>原话里没有这些字。<br/>换个说法，或者让 AI 结合你的近况回想。</p>" +
+      '<button class="find-ask solid" data-find-ask>问问 AI：「' +
+      esc(f.q) +
+      "」</button></div>"
+    );
+  }
+
+  function findHtml() {
+    const f = ui.find;
+    const hits = findHits();
+    if (!hits.length) return findEmptyHtml(f);
+    let html = '<div class="stream-spacer"></div><div class="find-list">';
+    let prev = null;
+    let lastDay = null;
+    for (const n of f.items) {
+      const gap = n.pos - (prev ? prev.pos : 0) - 1;
+      if (gap > 0) html += foldHtml(prev, n, gap);
+      const day = dayLabel(n.at);
+      if (day !== lastDay) {
+        html += '<div class="day-label">' + day + "</div>";
+        lastDay = day;
+      }
+      html += noteHtml(n, f.terms);
+      prev = n;
+    }
+    if (f.total > prev.pos) html += foldHtml(prev, null, f.total - prev.pos);
+    return html + "</div>" + findFootHtml(f, hits);
+  }
+
+  function paintFindCount() {
+    const f = ui.find;
+    if (!f) return;
+    const n = findHits().length;
+    el.findCount.textContent = !f.q ? "" : f.cur >= 0 && n ? f.cur + 1 + " / " + n : n + " 条";
+  }
+
+  function setFindTabbable(on) {
+    el.findIn.tabIndex = on ? 0 : -1;
+    $(".find-close").tabIndex = on ? 0 : -1;
+  }
+
+  function openFind() {
+    if (!ensureReady()) return;
+    if (isMobile() && ui.mode !== "cap") goMode("cap");
+    if (!ui.find) {
+      ui.find = newFind();
+      el.left.classList.add("finding");
+      setFindTabbable(true);
+      el.findIn.value = ui.lastFind;
+      if (ui.lastFind) scheduleFind(ui.lastFind, 0);
+    }
+    el.findIn.focus({ preventScroll: true });
+    el.findIn.select();
+    paintFindCount();
+  }
+
+  function closeFind(opt = {}) {
+    const f = ui.find;
+    if (!f) return;
+    clearTimeout(scheduleFind.timer);
+    if (f.ctrl) f.ctrl.abort();
+    ui.lastFind = el.findIn.value.trim();
+    const shown = findActive();
+    ui.find = null;
+    el.left.classList.remove("finding", "find-busy");
+    setFindTabbable(false);
+    if (document.activeElement === el.findIn) {
+      if (opt.focusCap && !isMobile()) el.capIn.focus({ preventScroll: true });
+      else el.findIn.blur();
+    }
+    if (shown) paintNotes({ bottom: true });
+  }
+
+  function scheduleFind(value, delay = 200) {
+    const f = ui.find;
+    if (!f) return;
+    const q = value.trim();
+    clearTimeout(scheduleFind.timer);
+    if (f.ctrl) f.ctrl.abort();
+    if (!q) {
+      const shown = findActive();
+      Object.assign(f, newFind());
+      el.left.classList.remove("find-busy");
+      if (shown) paintNotes({ bottom: true });
+      paintFindCount();
+      return;
+    }
+    el.left.classList.add("find-busy");
+    scheduleFind.timer = setTimeout(() => runFind(q), delay);
+  }
+
+  // 新结果回来之前保留上一次的结果，避免每敲一个字就闪一下
+  async function runFind(q) {
+    const f = ui.find;
+    if (!f) return;
+    const ctrl = (f.ctrl = new AbortController());
+    try {
+      const res = await api("v1/notes/search?q=" + encodeURIComponent(q), { signal: ctrl.signal });
+      if (ui.find !== f || ctrl.signal.aborted) return;
+      Object.assign(f, {
+        q,
+        terms: res.terms,
+        matched: res.matched,
+        total: res.total,
+        capped: res.capped,
+        cur: -1,
+        items: res.notes.map((r) => Object.assign(normNote(r), { pos: r.pos, near: r.near, hit: true, enter: true })),
+      });
+      el.left.classList.remove("find-busy");
+      paintNotes({ bottom: true });
+      paintFindCount();
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      el.left.classList.remove("find-busy");
+      toast(err.message);
+    }
+  }
+
+  function moveCur(dir) {
+    const f = ui.find;
+    const hits = findHits();
+    if (!f || !hits.length) return;
+    f.cur = f.cur < 0 ? hits.length - 1 : Math.max(0, Math.min(hits.length - 1, f.cur + dir));
+    applyCur();
+    const node = el.leftStream.querySelector('[data-note-seq="' + hits[f.cur].seq + '"]');
+    if (node) ensureVisible(node);
+  }
+
+  function applyCur() {
+    const f = ui.find;
+    const hit = f && f.cur >= 0 ? findHits()[f.cur] : null;
+    el.leftStream.querySelectorAll(".note.cur").forEach((n) => n.classList.remove("cur"));
+    if (hit) {
+      const node = el.leftStream.querySelector('[data-note-seq="' + hit.seq + '"]');
+      if (node) node.classList.add("cur");
+    }
+    paintFindCount();
+  }
+
+  function locateNote(seq) {
+    closeFind({ focusCap: true });
+    flashNotes([seq]);
+  }
+
+  async function expandFold(btn) {
+    const f = ui.find;
+    if (!f || btn.classList.contains("loading")) return;
+    btn.classList.add("loading");
+    const after = btn.dataset.foldAfter;
+    const before = btn.dataset.foldBefore;
+    const qs = [after && "after_seq=" + after, before && "before_seq=" + before].filter(Boolean).join("&");
+    try {
+      const res = await api("v1/notes/between?" + qs);
+      if (ui.find !== f) return;
+      const have = new Set(f.items.map((n) => n.seq));
+      for (const r of res.notes) {
+        if (!have.has(r.seq)) f.items.push(Object.assign(normNote(r), { pos: r.pos, hit: false, enter: true }));
+      }
+      f.items.sort((a, b) => a.seq - b.seq);
+      paintNotes({ anchor: Number(before || after) });
+      applyCur();
+    } catch (err) {
+      btn.classList.remove("loading");
+      toast(err.message);
+    }
+  }
+
+  // 原话里找不到，就把这句话交给询问：记录侧亮起的相关条目会接着浮现
+  function askFromFind() {
+    const q = el.findIn.value.trim();
+    closeFind();
+    if (!q) return;
+    el.askIn.value = q;
+    draft.set("ask", q);
+    autosize(el.askIn);
+    updateSend("ask");
+    scheduleRecall(q);
+    if (isMobile()) {
+      goMode("ask");
+      el.askIn.focus({ preventScroll: true });
+    } else {
+      focusMode("ask");
+    }
+  }
+
+  function wireFind() {
+    el.findIn.addEventListener("input", (e) => {
+      if (!e.isComposing) scheduleFind(el.findIn.value);
+    });
+    el.findIn.addEventListener("compositionend", () => scheduleFind(el.findIn.value));
+    el.findIn.addEventListener("keydown", (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        closeFind({ focusCap: true });
+      } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        e.preventDefault();
+        moveCur(e.key === "ArrowUp" ? -1 : 1);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (isMobile()) return el.findIn.blur();
+        const f = ui.find;
+        const hits = findHits();
+        if (f && f.cur >= 0 && hits[f.cur]) locateNote(hits[f.cur].seq);
+        else if (hits.length) moveCur(-1);
+        else if (findActive()) askFromFind();
+      }
+    });
   }
 
   /* ───────── 问答流 ───────── */
@@ -777,6 +1090,9 @@
 
   async function logout() {
     closeMenu();
+    closeFind();
+    ui.lastFind = "";
+    el.findIn.value = "";
     try {
       await api("v1/session/forget", { method: "POST", quiet401: true });
     } catch (e) {}
@@ -888,9 +1204,17 @@
     input.style.height = Math.min(input.scrollHeight, 110) + "px";
   }
 
+  // 手机上记录框空着时，发送键是「找记录」（像聊天应用空着是语音、有字才是发送），写了字才变回「记下」
   function updateSend(mode) {
     const input = document.getElementById(MODES[mode].input);
-    input.parentNode.querySelector(".send").classList.toggle("disabled", !input.value.trim());
+    const btn = input.parentNode.querySelector(".send");
+    const empty = !input.value.trim();
+    btn.classList.toggle("disabled", empty);
+    if (mode !== "cap") return;
+    const asFind = empty && isMobile();
+    btn.classList.toggle("as-find", asFind);
+    btn.setAttribute("aria-label", asFind ? "在记录里找" : "记下");
+    btn.title = asFind ? "在记录里找" : "记下";
   }
 
   function wireInputs() {
@@ -934,6 +1258,7 @@
     if (!note) {
       const text = el.capIn.value.trim();
       if (!text || !ensureReady()) return;
+      closeFind();
       clearComposer("cap");
       note = { local: ++localSeq, seq: null, content: text, at: Date.now(), status: "pending", kind: "capture", state: "sending", enter: true };
       S.notes.push(note);
@@ -1068,6 +1393,7 @@
   }
 
   async function flashNotes(seqs) {
+    closeFind();
     await ensureNotesLoaded(seqs);
     const hits = [];
     el.leftStream.querySelectorAll(".note[data-note-seq]").forEach((n) => {
@@ -1079,6 +1405,7 @@
       }
     });
     if (hits.length) ensureVisible(hits[hits.length - 1]);
+    else if (seqs.length) toast("这条记录比较早，没能定位到");
     clearTimeout(flashNotes.timer);
     flashNotes.timer = setTimeout(() => {
       el.leftStream.querySelectorAll(".note.highlight").forEach((n) => n.classList.remove("highlight"));
@@ -1164,7 +1491,7 @@
   /* ───────── 事件 ───────── */
 
   function handleAct(act) {
-    if (act === "send-cap") doCap();
+    if (act === "send-cap") isMobile() && !el.capIn.value.trim() ? openFind() : doCap();
     else if (act === "send-ask") doAsk();
     else if (act === "ctx") ui.menu === "ctx" ? closeMenu() : openCtx();
     else if (act === "account") {
@@ -1174,6 +1501,8 @@
     else if (act === "logout") logout();
     else if (act === "send-code") sendCode();
     else if (act === "reboot") boot();
+    else if (act === "find") openFind();
+    else if (act === "find-close") closeFind({ focusCap: true });
   }
 
   root.addEventListener("click", (e) => {
@@ -1186,11 +1515,21 @@
       closeMenu();
       return;
     }
+    // 手机上已在记录页时再点一次「记录」：打开找记录（记录框有字时发送键不是放大镜，这是另一个入口）
     const go = e.target.closest("[data-go]");
+    if (go && isMobile() && go.matches(".ws-title") && go.dataset.go === "cap" && ui.mode === "cap") return openFind();
     if (go) return switchTo(go.dataset.go);
 
     const ask = e.target.closest("[data-ask]");
     if (ask) return doAsk(ask.dataset.ask);
+
+    const fold = e.target.closest(".fold");
+    if (fold) return expandFold(fold);
+
+    if (e.target.closest("[data-find-ask]")) return askFromFind();
+
+    const locate = e.target.closest("[data-locate]");
+    if (locate && window.getSelection().isCollapsed) return locateNote(Number(locate.dataset.locate));
 
     const cue = e.target.closest("[data-seqs]");
     if (cue) {
@@ -1254,13 +1593,21 @@
     if (e.target.closest("[data-keep-focus]")) e.preventDefault();
   });
 
+  // 「/」打开找记录：焦点不在输入框里，或者记录输入框还是空的（记录很少以「/」开头）
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeMenu();
+    if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey || e.isComposing || ui.loginShown || isMobile()) return;
+    const t = e.target;
+    const typing = t && t.matches && t.matches("textarea, input");
+    if (typing && !(t === el.capIn && !t.value)) return;
+    e.preventDefault();
+    openFind();
   });
 
   mobileMq.addEventListener("change", () => {
     syncPager();
     [el.capIn, el.askIn].forEach(autosize);
+    updateSend("cap");
   });
 
   // iOS 键盘弹起时可视区变矮：让应用高度跟随可视区，输入框始终贴在键盘上方

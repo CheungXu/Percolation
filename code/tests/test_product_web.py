@@ -160,7 +160,25 @@ def test_threads_notes_and_recall_against_db():
             m2 = await capture(services, user, "cforce 15.6 oled 便携屏 999 蹲")
             m3 = await capture(services, user, "周四下午三点和陈总在福田站碰面")
             m4 = await capture(services, user, "陈总习惯看纸质版，记得打印两份报价单")
-            await capture(services, user, "凑数的一条")
+            m5 = await capture(services, user, "凑数的一条")
+
+            found = await views.search_notes(services, user, "陈总")
+            assert [n["seq"] for n in found["notes"] if not n["near"]] == [m3["msg_seq"], m4["msg_seq"]]
+            assert found["matched"] == 2 and found["total"] == 5 and found["capped"] is False
+            assert [n["pos"] for n in found["notes"] if not n["near"]] == [3, 4]
+            both = await views.search_notes(services, user, "CFORCE  OLED")
+            assert both["terms"] == ["cforce", "oled"] and [n["seq"] for n in both["notes"]] == [m2["msg_seq"]]
+            assert (await views.search_notes(services, user, "   "))["notes"] == []
+            # 中文整句不加空格：切成记录里出现过的二字组，都出现才算字面命中
+            joined = await views.search_notes(services, user, "陈总报价单")
+            assert joined["terms"] == ["陈总", "报价", "价单"] and joined["matched"] == 1
+            assert [n["seq"] for n in joined["notes"] if not n["near"]] == [m4["msg_seq"]]
+
+            gap = await views.notes_between(services, user, after_seq=m1["msg_seq"], before_seq=m4["msg_seq"], edge=1)
+            assert [n["seq"] for n in gap["notes"]] == [m2["msg_seq"], m3["msg_seq"]] and gap["hidden"] == 0
+            lead = await views.notes_between(services, user, after_seq=None, before_seq=m5["msg_seq"], edge=1)
+            assert [n["seq"] for n in lead["notes"]] == [m4["msg_seq"]] and lead["notes"][0]["pos"] == 4
+            assert lead["hidden"] == 3
 
             page = await views.list_notes(services, user, limit=2)
             assert page["total"] == 5 and page["has_more"] is True

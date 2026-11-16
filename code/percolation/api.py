@@ -249,6 +249,28 @@ async def notes_endpoint(
     return await views.list_notes(services, user, before_seq=before_seq, limit=limit)
 
 
+@app.get("/v1/notes/search")
+async def notes_search_endpoint(
+    q: str = Query(default="", max_length=200),
+    services: Services = Depends(get_services),
+    user: UserRef = Depends(get_user),
+) -> dict:
+    return await views.search_notes(services, user, q)
+
+
+@app.get("/v1/notes/between")
+async def notes_between_endpoint(
+    after_seq: int | None = Query(default=None, ge=0),
+    before_seq: int | None = Query(default=None, ge=1),
+    edge: int = Query(default=views.FOLD_EDGE, ge=1, le=50),
+    services: Services = Depends(get_services),
+    user: UserRef = Depends(get_user),
+) -> dict:
+    if after_seq is None and before_seq is None:
+        raise HTTPException(status_code=422, detail="after_seq 和 before_seq 至少给一个")
+    return await views.notes_between(services, user, after_seq=after_seq, before_seq=before_seq, edge=edge)
+
+
 @app.get("/v1/threads")
 async def threads_endpoint(
     before_id: str | None = Query(default=None),

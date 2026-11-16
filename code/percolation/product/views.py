@@ -85,6 +85,127 @@ async def get_note(services: Services, user: UserRef, seq: int) -> dict | None:
     return note_payload(row) if row else None
 
 
+# ---------- 检索原话 ----------
+# 字面检索：空格分开的每个词都要出现（不区分大小写）。另用边问边浮现的词面召回补几条「意思相近」。
+# 每条命中带 pos（在全部原话里的名次），前端据此算出相邻命中之间折叠了多少条。
+
+SEARCH_MAX_HITS = 200
+SEARCH_MAX_TERMS = 8
+SEARCH_NEAR = 5
+FOLD_EDGE = 3
+
+NOTE_COLUMNS = "msg_seq, content, captured_at, dream_status, source_kind"
+
+
+def search_terms(query: str) -> list[str]:
+    terms = [t[:50] for t in (query or "").lower().split() if t]
+    return list(dict.fromkeys(terms))[:SEARCH_MAX_TERMS]
+
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]{3,}")
+
+_MATCHED_SQL = """
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE NOT EXISTS (
+         SELECT 1 FROM unnest(%s::text[]) t WHERE strpos(lower(content), t) = 0
+       )) AS matched
+FROM raw_messages
+"""
+
+
+async def _split_cjk_terms(conn: AsyncConnection, query: str) -> list[str]:
+    """中文整句不加空格时（「陈总报价」）原样当子串几乎搜不到。切成二字组，
+    只留在记录里确实出现过的，跨词边界切出的「总报」不会让整条落空。"""
+    rows = await (
+        await conn.execute(
+            """
+            SELECT tok FROM unnest(%s::text[]) WITH ORDINALITY AS t(tok, i)
+            WHERE EXISTS (SELECT 1 FROM raw_messages WHERE strpos(lower(content), t.tok) > 0)
+            ORDER BY i
+            """,
+            (recall_tokens(query),),
+        )
+    ).fetchall()
+    return [r["tok"] for r in rows]
+
+
+async def search_notes(services: Services, user: UserRef, query: str) -> dict:
+    terms = search_terms(query)
+    if not terms:
+        return {"terms": [], "notes": [], "matched": 0, "total": 0, "capped": False}
+    near = await recall(services, user, query, limit=SEARCH_NEAR)
+    async with services.tx(user) as conn:
+        counts = await (await conn.execute(_MATCHED_SQL, (terms,))).fetchone()
+        if not counts["matched"] and _CJK_RE.search(query):
+            split = await _split_cjk_terms(conn, query)
+            if split:
+                terms = split
+                counts = await (await conn.execute(_MATCHED_SQL, (terms,))).fetchone()
+        rows = await (
+            await conn.execute(
+                f"""
+                WITH ranked AS (
+                  SELECT {NOTE_COLUMNS}, row_number() OVER (ORDER BY msg_seq) AS pos FROM raw_messages
+                ),
+                lit AS (
+                  SELECT * FROM ranked r
+                  WHERE NOT EXISTS (SELECT 1 FROM unnest(%(terms)s::text[]) t WHERE strpos(lower(r.content), t) = 0)
+                ),
+                picked AS (
+                  (SELECT *, false AS near FROM lit ORDER BY msg_seq DESC LIMIT %(cap)s)
+                  UNION ALL
+                  (SELECT *, true AS near FROM ranked
+                   WHERE msg_seq = ANY(%(near)s::bigint[]) AND msg_seq NOT IN (SELECT msg_seq FROM lit))
+                )
+                SELECT * FROM picked ORDER BY msg_seq
+                """,
+                {"terms": terms, "near": near, "cap": SEARCH_MAX_HITS},
+            )
+        ).fetchall()
+    return {
+        "terms": terms,
+        "notes": [{**note_payload(r), "pos": r["pos"], "near": r["near"]} for r in rows],
+        "matched": counts["matched"],
+        "total": counts["total"],
+        "capped": counts["matched"] > SEARCH_MAX_HITS,
+    }
+
+
+async def notes_between(
+    services: Services, user: UserRef, *, after_seq: int | None, before_seq: int | None, edge: int = FOLD_EDGE
+) -> dict:
+    """展开一段折叠：只取紧挨两侧命中的各 edge 条，剩下的继续折叠。
+    开头的折叠（after_seq 为空）只取靠近第一个命中的一侧，结尾的同理；剩得不多就整段给出。"""
+    edge = _clamp(edge, 1, 50)
+    head = edge if after_seq is not None else 0
+    tail = edge if before_seq is not None else 0
+    async with services.tx(user) as conn:
+        rows = await (
+            await conn.execute(
+                f"""
+                WITH ranked AS (
+                  SELECT {NOTE_COLUMNS}, row_number() OVER (ORDER BY msg_seq) AS pos FROM raw_messages
+                ),
+                span AS (
+                  SELECT *,
+                         row_number() OVER (ORDER BY msg_seq) AS a,
+                         row_number() OVER (ORDER BY msg_seq DESC) AS d,
+                         count(*) OVER () AS n
+                  FROM ranked
+                  WHERE (%(after)s::bigint IS NULL OR msg_seq > %(after)s::bigint)
+                    AND (%(before)s::bigint IS NULL OR msg_seq < %(before)s::bigint)
+                )
+                SELECT * FROM span
+                WHERE n <= %(head)s + %(tail)s + 2 OR a <= %(head)s OR d <= %(tail)s
+                ORDER BY msg_seq
+                """,
+                {"after": after_seq, "before": before_seq, "head": head, "tail": tail},
+            )
+        ).fetchall()
+    n = rows[0]["n"] if rows else 0
+    return {"notes": [{**note_payload(r), "pos": r["pos"]} for r in rows], "hidden": n - len(rows)}
+
+
 # ---------- 问答线程 ----------
 
 
