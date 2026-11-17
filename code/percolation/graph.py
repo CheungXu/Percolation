@@ -231,7 +231,7 @@ async def build_graph(
                     dict(r)
                     for r in await (
                         await conn.execute(
-                            "SELECT msg_seq, content, captured_at, dream_status FROM raw_messages WHERE msg_seq = ANY(%s) ORDER BY msg_seq",
+                            "SELECT msg_seq, content, captured_at, dream_status FROM raw_messages WHERE msg_seq = ANY(%s) AND deleted_at IS NULL ORDER BY msg_seq",
                             (all_seqs,),
                         )
                     ).fetchall()

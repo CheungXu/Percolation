@@ -13,9 +13,12 @@ import httpx
 import pytest
 
 from agentkit.envfile import load_env_file
+from psycopg import Error as PsycopgError
 from agentkit.tenancy import create_pool
-from percolation import tenants
-from percolation.capture import capture
+from percolation import retriever, tenants
+from percolation.agents.dream import _scrub_deleted_anchors
+from percolation.agents.search import ask
+from percolation.capture import capture, delete_messages, purge_in_tx, restore_messages, revise
 from percolation.product import views
 from percolation.product.identity import (
     Account,
@@ -64,6 +67,66 @@ def test_recall_tokens_drop_function_words():
     assert not {"多少", "买的", "之前"} & set(tokens)
     assert {"cforce", "oled"} <= set(views.recall_tokens("CFORCE OLED 什么价"))
     assert views.recall_tokens("吗") == []
+
+
+def test_strip_deleted_anchor_lines_drops_dead_lines_and_mixed_marks():
+    text = "\n".join(
+        [
+            "- 留下 [#msg_1]",
+            "- 整行删掉 [#msg_2]",
+            "- 混合 [#msg_1] [#msg_2]",
+            "没有锚点",
+        ]
+    )
+    cleaned = retriever.strip_deleted_anchor_lines(text, {2})
+    assert "整行删掉" not in cleaned
+    assert "[#msg_2]" not in cleaned
+    assert "留下 [#msg_1]" in cleaned
+    assert "混合 [#msg_1]" in cleaned
+    assert "没有锚点" in cleaned
+    assert retriever.strip_deleted_anchor_lines(text, set()) == text
+
+
+def test_scrub_deleted_anchors_unlinks_empty_page(tmp_path):
+    from percolation.memory_fs import open_workspace
+
+    ws = open_workspace(tmp_path)
+    page = tmp_path / "wiki" / "gear.md"
+    page.write_text(
+        "---\ntitle: 显示器\ntype: topic\n---\n\n## 待购\n\n- [confirmed] 只剩这条 [#msg_9]\n",
+        encoding="utf-8",
+    )
+    memory = tmp_path / "MEMORY.md"
+    memory.write_text("# 运行注入区\n\n## 暗语\n\n- 雕牌屏 [#msg_9]\n- 留下 [#msg_1]\n", encoding="utf-8")
+    _scrub_deleted_anchors(ws, {9})
+    assert not page.exists()
+    kept = memory.read_text(encoding="utf-8")
+    assert "#msg_9" not in kept and "留下 [#msg_1]" in kept
+
+
+def test_step_payload_marks_revised_and_deleted_citations():
+    t0 = datetime(2026, 11, 15, 9, tzinfo=UTC)
+    row = {
+        "id": "s1",
+        "query_text": "报价单带几份",
+        "is_reask": True,
+        "outcome": "answered",
+        "answer_text": "两份",
+        "clarify_question": None,
+        "verified_msg_seqs": [1, 2],
+        "hit_doc_paths": [],
+        "created_at": t0,
+    }
+    payload = views.step_payload(
+        row,
+        {},
+        note_states={
+            1: {"deleted": True, "edited_at": None},
+            2: {"deleted": False, "edited_at": t0 + timedelta(minutes=5)},
+        },
+    )
+    assert payload["query"] == "报价单带几份" and payload["reask"] is True
+    assert payload["deleted_seqs"] == [1] and payload["updated_seqs"] == [2]
 
 
 def test_parse_memory_and_page_highlights_strip_markers():
@@ -230,6 +293,99 @@ def test_threads_notes_and_recall_against_db():
     asyncio.run(main())
 
 
+@needs_db
+def test_revise_delete_restore_and_purge():
+    async def main():
+        owner_url = DB_ENV["MIGRATE_DATABASE_URL"]
+        slug = f"e2e-unit-life-{int(time.time() * 1000)}"
+        services = await Services.open()
+        await tenants.create_tenant(owner_url, slug)
+        try:
+            user = await services.resolve_user(slug)
+            saved = await capture(services, user, "周四见陈总，带两份纸质报价单")
+            seq = saved["msg_seq"]
+            other = await capture(services, user, "下周三去瑞尔齿科")
+
+            async with services.tx(user) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO search_logs (user_id, query_text, route_path, outcome, answer_text, verified_msg_seqs)
+                    VALUES (%s, '报价单带几份', 'primary_direct', 'answered', '两份', %s)
+                    """,
+                    (user.id, [seq]),
+                )
+            await revise(services, user, seq, "周四见陈总，带三份纸质报价单")
+            note = await views.get_note(services, user, seq)
+            assert note["content"] == "周四见陈总，带三份纸质报价单"
+            assert note["revisions"] == 1 and note["status"] == "pending"
+            revs = await views.list_note_revisions(services, user, seq)
+            assert revs[0]["prev"] == "周四见陈总，带两份纸质报价单"
+            assert revs[0]["next"] == note["content"]
+            # 原话没变时不另记一版
+            await revise(services, user, seq, note["content"])
+            assert len(await views.list_note_revisions(services, user, seq)) == 1
+
+            literal = await views.search_notes(services, user, "三份")
+            assert [n["seq"] for n in literal["notes"] if not n["near"]] == [seq]
+            old = await views.search_notes(services, user, "两份")
+            assert [n["seq"] for n in old["notes"] if not n["near"]] == []
+
+            # 应用角色没有 content 的 UPDATE 权限；即便以后放开列权限，触发器仍会拦住受控函数之外的改写。
+            with pytest.raises(PsycopgError, match="permission denied|controlled functions"):
+                async with services.tx(user) as conn:
+                    await conn.execute("UPDATE raw_messages SET content = '偷偷改' WHERE msg_seq = %s", (seq,))
+
+            cited = await views.get_note(services, user, seq)
+            assert cited["cited"] == 1
+            assert (await views.list_threads(services, user))["threads"][0]["steps"][0]["updated_seqs"] == [seq]
+
+            deleted = await delete_messages(services, user, [seq, other["msg_seq"]])
+            assert deleted == sorted([seq, other["msg_seq"]])
+            assert await views.get_note(services, user, seq) is None
+            assert (await views.list_notes(services, user))["total"] == 0
+            assert await views.recall(services, user, "陈总报价") == []
+            gone = await views.search_notes(services, user, "三份")
+            assert gone["notes"] == [] and gone["matched"] == 0 and gone["total"] == 0
+            hidden = await views.list_threads(services, user)
+            assert hidden["threads"][0]["steps"][0]["deleted_seqs"] == [seq]
+
+            restored = await restore_messages(services, user, [seq])
+            assert restored == [seq]
+            back = await views.get_note(services, user, seq)
+            assert back["content"].endswith("三份纸质报价单")
+            assert (await views.list_threads(services, user))["threads"][0]["steps"][0]["deleted_seqs"] == []
+            assert (await views.list_threads(services, user))["threads"][0]["steps"][0]["updated_seqs"] == [seq]
+
+            thread_id = hidden["threads"][0]["id"]
+            assert await views.delete_thread(services, user, thread_id) is True
+            assert (await views.list_threads(services, user))["threads"] == []
+            assert await views.restore_thread(services, user, thread_id) is True
+            assert (await views.list_threads(services, user))["threads"][0]["id"] == thread_id
+
+            with pytest.raises(LookupError):
+                await ask(services, user, "再问一次", reask_of=str(uuid.uuid4()))
+
+            await delete_messages(services, user, [seq])
+            async with services.tx(user) as conn:
+                purged = await purge_in_tx(conn, [seq])
+            assert purged == [seq]
+            async with services.tx(user) as conn:
+                row = await (
+                    await conn.execute("SELECT content, purged_at FROM raw_messages WHERE msg_seq = %s", (seq,))
+                ).fetchone()
+                left = await (
+                    await conn.execute("SELECT count(*) AS n FROM raw_message_revisions WHERE msg_seq = %s", (seq,))
+                ).fetchone()
+            assert row["content"] == "" and row["purged_at"] is not None and left["n"] == 0
+            assert await restore_messages(services, user, [seq]) == []
+            assert await views.list_note_revisions(services, user, seq) is None
+        finally:
+            await services.close()
+            await tenants.drop_tenant(owner_url, slug, NAS_ROOT)
+
+    asyncio.run(main())
+
+
 class _StubAuth:
     def __init__(self, account: Account) -> None:
         self._account = account
@@ -278,6 +434,22 @@ def test_api_star_page_mode_end_to_end():
             assert saved["note"]["status"] == "pending"
             assert client.get("/v1/notes").json()["total"] == 1
             assert client.get("/v1/recall", params={"q": "陈总那边要带什么"}).json() == {"seqs": [saved["msg_seq"]]}
+            seq = saved["msg_seq"]
+            revised = client.patch(f"/v1/notes/{seq}", json={"content": "周四见陈总，带三份纸质报价单"}).json()
+            assert revised["note"]["revisions"] == 1
+            assert revised["revisions"][0]["prev"] == "周四见陈总，带两份纸质报价单"
+            assert client.get(f"/v1/notes/{seq}/revisions").status_code == 200
+            hit = client.get("/v1/notes/search", params={"q": "三份"}).json()
+            assert [n["seq"] for n in hit["notes"] if not n["near"]] == [seq]
+            assert client.post("/v1/notes/delete", json={"seqs": [seq]}).json()["deleted"] == [seq]
+            assert client.get("/v1/notes").json()["total"] == 0
+            assert client.get("/v1/recall", params={"q": "陈总那边要带什么"}).json()["seqs"] == []
+            assert client.get(f"/v1/notes/{seq}/revisions").status_code == 404
+            back = client.post("/v1/notes/restore", json={"seqs": [seq]}).json()
+            assert back["restored"] == [seq] and back["notes"][0]["content"].endswith("三份纸质报价单")
+            assert client.get("/v1/notes").json()["total"] == 1
+            assert client.patch(f"/v1/notes/{seq}", json={"content": "   "}).status_code == 422
+            assert client.post("/v1/search", json={"query": "再问", "reask_of": "not-a-uuid"}).status_code == 404
             assert client.get("/v1/threads").json() == {"threads": [], "has_more": False}
             assert client.get("/v1/threads", params={"before_id": "x"}).status_code == 422
             assert client.get("/v1/context").json()["stats"]["notes"] == 1

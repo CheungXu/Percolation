@@ -1,4 +1,4 @@
-"""给网页用的读模型：记录流、问答线程、边问边浮现、近况、当日用量。
+"""给网页用的读模型：记录流、原话检索、修订历史、问答线程、边问边浮现、近况、当日用量。
 
 全部在租户事务里执行，受强制 RLS 约束。工作区文件按路径直接读，不调用 open_workspace，
 避免「看一眼近况」就在 NAS 上初始化一个 git 仓库。
@@ -15,6 +15,7 @@ from typing import Any
 
 from psycopg import AsyncConnection
 
+from percolation import retriever
 from percolation.agents.search import SearchOutcome
 from percolation.memory_fs import MEMORY_FILE
 from percolation.services import Services, UserRef
@@ -30,9 +31,11 @@ MAX_CUES = 3
 RECALL_SCAN = 3000
 RECALL_LOOSE_TOKENS = 3
 
+NOTE_COLUMNS = "msg_seq, content, captured_at, dream_status, source_kind, edited_at, revision_count, ever_archived"
+
 STEP_COLUMNS = """
   id::text AS id, query_text, outcome, answer_text, clarify_question,
-  verified_msg_seqs, hit_doc_paths, parent_search_id::text AS parent_id, created_at
+  verified_msg_seqs, hit_doc_paths, parent_search_id::text AS parent_id, is_reask, created_at
 """
 
 
@@ -40,16 +43,39 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
-# ---------- 记录流 ----------
+# ---------- 记录流与修订历史 ----------
 
 
-def note_payload(row: dict) -> dict:
+async def _cited_counts(conn: AsyncConnection, seqs: list[int]) -> dict[int, int]:
+    if not seqs:
+        return {}
+    rows = await (
+        await conn.execute(
+            """
+            SELECT s_seq AS seq, count(*)::int AS n
+            FROM search_logs sl, unnest(sl.verified_msg_seqs) AS s_seq
+            WHERE sl.deleted_at IS NULL
+              AND sl.outcome = 'answered'
+              AND s_seq = ANY(%s::bigint[])
+            GROUP BY s_seq
+            """,
+            (seqs,),
+        )
+    ).fetchall()
+    return {int(r["seq"]): int(r["n"]) for r in rows}
+
+
+def note_payload(row: dict, *, cited: int = 0) -> dict:
     return {
         "seq": row["msg_seq"],
         "content": row["content"],
         "at": row["captured_at"].isoformat(),
         "status": row["dream_status"],
         "kind": row["source_kind"],
+        "edited_at": row["edited_at"].isoformat() if row.get("edited_at") else None,
+        "revisions": int(row.get("revision_count") or 0),
+        "ever_archived": bool(row.get("ever_archived") or row["dream_status"] == "archived"),
+        "cited": cited,
     }
 
 
@@ -58,43 +84,94 @@ async def list_notes(services: Services, user: UserRef, *, before_seq: int | Non
     async with services.tx(user) as conn:
         rows = await (
             await conn.execute(
-                """
-                SELECT msg_seq, content, captured_at, dream_status, source_kind
+                f"""
+                SELECT {NOTE_COLUMNS}
                 FROM raw_messages
-                WHERE %(before)s::bigint IS NULL OR msg_seq < %(before)s::bigint
+                WHERE deleted_at IS NULL
+                  AND (%(before)s::bigint IS NULL OR msg_seq < %(before)s::bigint)
                 ORDER BY msg_seq DESC
                 LIMIT %(limit)s
                 """,
                 {"before": before_seq, "limit": limit + 1},
             )
         ).fetchall()
+        picked = list(reversed(rows[:limit]))
+        cited = await _cited_counts(conn, [r["msg_seq"] for r in picked])
         total = None
         if before_seq is None:
-            total = (await (await conn.execute("SELECT count(*) AS n FROM raw_messages")).fetchone())["n"]
-    return {"notes": [note_payload(r) for r in reversed(rows[:limit])], "has_more": len(rows) > limit, "total": total}
+            total = (await (await conn.execute("SELECT count(*) AS n FROM raw_messages WHERE deleted_at IS NULL")).fetchone())["n"]
+    return {
+        "notes": [note_payload(r, cited=cited.get(r["msg_seq"], 0)) for r in picked],
+        "has_more": len(rows) > limit,
+        "total": total,
+    }
 
 
 async def get_note(services: Services, user: UserRef, seq: int) -> dict | None:
     async with services.tx(user) as conn:
         row = await (
             await conn.execute(
-                "SELECT msg_seq, content, captured_at, dream_status, source_kind FROM raw_messages WHERE msg_seq = %s",
+                f"SELECT {NOTE_COLUMNS} FROM raw_messages WHERE msg_seq = %s AND deleted_at IS NULL",
                 (seq,),
             )
         ).fetchone()
-    return note_payload(row) if row else None
+        if not row:
+            return None
+        cited = await _cited_counts(conn, [seq])
+    return note_payload(row, cited=cited.get(seq, 0))
+
+
+async def get_notes(services: Services, user: UserRef, seqs: list[int]) -> list[dict]:
+    if not seqs:
+        return []
+    async with services.tx(user) as conn:
+        rows = await (
+            await conn.execute(
+                f"SELECT {NOTE_COLUMNS} FROM raw_messages WHERE msg_seq = ANY(%s) AND deleted_at IS NULL ORDER BY msg_seq",
+                (seqs,),
+            )
+        ).fetchall()
+        cited = await _cited_counts(conn, [r["msg_seq"] for r in rows])
+    return [note_payload(r, cited=cited.get(r["msg_seq"], 0)) for r in rows]
+
+
+async def list_note_revisions(services: Services, user: UserRef, seq: int) -> list[dict] | None:
+    async with services.tx(user) as conn:
+        exists = await (
+            await conn.execute("SELECT 1 FROM raw_messages WHERE msg_seq = %s AND deleted_at IS NULL", (seq,))
+        ).fetchone()
+        if not exists:
+            return None
+        rows = await (
+            await conn.execute(
+                """
+                SELECT rev_no, prev_content, new_content, revised_at
+                FROM raw_message_revisions
+                WHERE msg_seq = %s
+                ORDER BY rev_no ASC
+                """,
+                (seq,),
+            )
+        ).fetchall()
+    return [
+        {
+            "rev": int(r["rev_no"]),
+            "prev": r["prev_content"],
+            "next": r["new_content"],
+            "at": r["revised_at"].isoformat(),
+        }
+        for r in rows
+    ]
 
 
 # ---------- 检索原话 ----------
 # 字面检索：空格分开的每个词都要出现（不区分大小写）。另用边问边浮现的词面召回补几条「意思相近」。
-# 每条命中带 pos（在全部原话里的名次），前端据此算出相邻命中之间折叠了多少条。
+# 每条命中带 pos（在全部未删原话里的名次），前端据此算出相邻命中之间折叠了多少条。
 
 SEARCH_MAX_HITS = 200
 SEARCH_MAX_TERMS = 8
 SEARCH_NEAR = 5
 FOLD_EDGE = 3
-
-NOTE_COLUMNS = "msg_seq, content, captured_at, dream_status, source_kind"
 
 
 def search_terms(query: str) -> list[str]:
@@ -110,6 +187,7 @@ SELECT count(*) AS total,
          SELECT 1 FROM unnest(%s::text[]) t WHERE strpos(lower(content), t) = 0
        )) AS matched
 FROM raw_messages
+WHERE deleted_at IS NULL
 """
 
 
@@ -120,7 +198,7 @@ async def _split_cjk_terms(conn: AsyncConnection, query: str) -> list[str]:
         await conn.execute(
             """
             SELECT tok FROM unnest(%s::text[]) WITH ORDINALITY AS t(tok, i)
-            WHERE EXISTS (SELECT 1 FROM raw_messages WHERE strpos(lower(content), t.tok) > 0)
+            WHERE EXISTS (SELECT 1 FROM raw_messages WHERE deleted_at IS NULL AND strpos(lower(content), t.tok) > 0)
             ORDER BY i
             """,
             (recall_tokens(query),),
@@ -145,7 +223,9 @@ async def search_notes(services: Services, user: UserRef, query: str) -> dict:
             await conn.execute(
                 f"""
                 WITH ranked AS (
-                  SELECT {NOTE_COLUMNS}, row_number() OVER (ORDER BY msg_seq) AS pos FROM raw_messages
+                  SELECT {NOTE_COLUMNS}, row_number() OVER (ORDER BY msg_seq) AS pos
+                  FROM raw_messages
+                  WHERE deleted_at IS NULL
                 ),
                 lit AS (
                   SELECT * FROM ranked r
@@ -162,9 +242,10 @@ async def search_notes(services: Services, user: UserRef, query: str) -> dict:
                 {"terms": terms, "near": near, "cap": SEARCH_MAX_HITS},
             )
         ).fetchall()
+        cited = await _cited_counts(conn, [r["msg_seq"] for r in rows])
     return {
         "terms": terms,
-        "notes": [{**note_payload(r), "pos": r["pos"], "near": r["near"]} for r in rows],
+        "notes": [{**note_payload(r, cited=cited.get(r["msg_seq"], 0)), "pos": r["pos"], "near": r["near"]} for r in rows],
         "matched": counts["matched"],
         "total": counts["total"],
         "capped": counts["matched"] > SEARCH_MAX_HITS,
@@ -184,7 +265,9 @@ async def notes_between(
             await conn.execute(
                 f"""
                 WITH ranked AS (
-                  SELECT {NOTE_COLUMNS}, row_number() OVER (ORDER BY msg_seq) AS pos FROM raw_messages
+                  SELECT {NOTE_COLUMNS}, row_number() OVER (ORDER BY msg_seq) AS pos
+                  FROM raw_messages
+                  WHERE deleted_at IS NULL
                 ),
                 span AS (
                   SELECT *,
@@ -202,8 +285,12 @@ async def notes_between(
                 {"after": after_seq, "before": before_seq, "head": head, "tail": tail},
             )
         ).fetchall()
+        cited = await _cited_counts(conn, [r["msg_seq"] for r in rows])
     n = rows[0]["n"] if rows else 0
-    return {"notes": [{**note_payload(r), "pos": r["pos"]} for r in rows], "hidden": n - len(rows)}
+    return {
+        "notes": [{**note_payload(r, cited=cited.get(r["msg_seq"], 0)), "pos": r["pos"]} for r in rows],
+        "hidden": n - len(rows),
+    }
 
 
 # ---------- 问答线程 ----------
@@ -227,21 +314,47 @@ def cue_labels(doc_paths: list[str], titles: dict[str, str]) -> list[str]:
     return seen[:MAX_CUES]
 
 
-def step_payload(row: dict, titles: dict[str, str], reply: dict | None = None) -> dict:
+def step_payload(
+    row: dict,
+    titles: dict[str, str],
+    reply: dict | None = None,
+    note_states: dict[int, dict] | None = None,
+) -> dict:
+    seqs = [int(s) for s in (row["verified_msg_seqs"] or [])]
+    deleted_seqs: list[int] = []
+    updated_seqs: list[int] = []
+    if note_states is not None and seqs:
+        created_at = row["created_at"]
+        for s in seqs:
+            st = note_states.get(s)
+            if st is None or st["deleted"]:
+                deleted_seqs.append(s)
+            elif st["edited_at"] is not None and st["edited_at"] > created_at:
+                updated_seqs.append(s)
     return {
         "search_id": row["id"],
+        "query": row.get("query_text") or "",
+        "reask": bool(row.get("is_reask")),
         "outcome": row["outcome"],
         "answer": row["answer_text"],
         "clarify_question": row["clarify_question"],
-        "seqs": list(row["verified_msg_seqs"] or []),
+        "seqs": seqs,
+        "deleted_seqs": deleted_seqs,
+        "updated_seqs": updated_seqs,
         "cues": cue_labels(list(row["hit_doc_paths"] or []), titles),
         "at": row["created_at"].isoformat(),
         "reply": {"seq": reply["msg_seq"], "content": reply["content"]} if reply else None,
     }
 
 
-def assemble_threads(roots: list[dict], children: list[dict], replies: list[dict], titles: dict[str, str]) -> list[dict]:
-    """roots 按时间倒序进来，返回按时间正序的线程；每个线程的 steps 依次是第一问和每次澄清后的重查。"""
+def assemble_threads(
+    roots: list[dict],
+    children: list[dict],
+    replies: list[dict],
+    titles: dict[str, str],
+    note_states: dict[int, dict] | None = None,
+) -> list[dict]:
+    """roots 按时间倒序进来，返回按时间正序的线程；每个线程的 steps 包含第一问、澄清重查与「改了再问」重答。"""
     by_root: dict[str, list[dict]] = defaultdict(list)
     for child in children:
         by_root[child["parent_id"]].append(child)
@@ -251,12 +364,16 @@ def assemble_threads(roots: list[dict], children: list[dict], replies: list[dict
     threads = []
     for root in reversed(roots):
         steps = [root, *sorted(by_root.get(root["id"], []), key=lambda r: r["created_at"])]
+        active_query = root["query_text"]
+        for s in steps:
+            if s.get("is_reask") and s.get("query_text"):
+                active_query = s["query_text"]
         threads.append(
             {
                 "id": root["id"],
-                "query": root["query_text"],
+                "query": active_query,
                 "at": root["created_at"].isoformat(),
-                "steps": [step_payload(s, titles, reply_by_search.get(s["id"])) for s in steps],
+                "steps": [step_payload(s, titles, reply_by_search.get(s["id"]), note_states) for s in steps],
             }
         )
     return threads
@@ -269,7 +386,9 @@ async def list_threads(services: Services, user: UserRef, *, before_id: str | No
             await conn.execute(
                 f"""
                 SELECT {STEP_COLUMNS} FROM search_logs
-                WHERE parent_search_id IS NULL AND (%(before)s::uuid IS NULL OR id < %(before)s::uuid)
+                WHERE parent_search_id IS NULL
+                  AND deleted_at IS NULL
+                  AND (%(before)s::uuid IS NULL OR id < %(before)s::uuid)
                 ORDER BY id DESC
                 LIMIT %(limit)s
                 """,
@@ -281,10 +400,15 @@ async def list_threads(services: Services, user: UserRef, *, before_id: str | No
         root_ids = [r["id"] for r in roots]
         children: list[dict] = []
         replies: list[dict] = []
+        note_states: dict[int, dict] = {}
         if root_ids:
             children = await (
                 await conn.execute(
-                    f"SELECT {STEP_COLUMNS} FROM search_logs WHERE parent_search_id = ANY(%s::uuid[]) ORDER BY id",
+                    f"""
+                    SELECT {STEP_COLUMNS} FROM search_logs
+                    WHERE parent_search_id = ANY(%s::uuid[]) AND deleted_at IS NULL
+                    ORDER BY id
+                    """,
                     (root_ids,),
                 )
             ).fetchall()
@@ -293,13 +417,24 @@ async def list_threads(services: Services, user: UserRef, *, before_id: str | No
                 await conn.execute(
                     """
                     SELECT msg_seq, content, reply_to_search_id::text AS search_id
-                    FROM raw_messages WHERE reply_to_search_id = ANY(%s::uuid[]) ORDER BY msg_seq
+                    FROM raw_messages
+                    WHERE reply_to_search_id = ANY(%s::uuid[]) AND deleted_at IS NULL
+                    ORDER BY msg_seq
                     """,
                     (all_ids,),
                 )
             ).fetchall()
+            all_seqs = sorted({int(s) for r in [*roots, *children] for s in (r["verified_msg_seqs"] or [])})
+            if all_seqs:
+                for mr in await (
+                    await conn.execute(
+                        "SELECT msg_seq, (deleted_at IS NOT NULL) AS deleted, edited_at FROM raw_messages WHERE msg_seq = ANY(%s)",
+                        (all_seqs,),
+                    )
+                ).fetchall():
+                    note_states[int(mr["msg_seq"])] = {"deleted": bool(mr["deleted"]), "edited_at": mr["edited_at"]}
         titles = await _page_titles(conn, {p for r in [*roots, *children] for p in (r["hit_doc_paths"] or [])})
-    return {"threads": assemble_threads(roots, children, replies, titles), "has_more": has_more}
+    return {"threads": assemble_threads(roots, children, replies, titles, note_states), "has_more": has_more}
 
 
 async def step_for_outcome(services: Services, user: UserRef, outcome: SearchOutcome) -> dict:
@@ -307,6 +442,8 @@ async def step_for_outcome(services: Services, user: UserRef, outcome: SearchOut
         titles = await _page_titles(conn, set(outcome.hit_doc_paths))
     row = {
         "id": outcome.search_id,
+        "query_text": outcome.query,
+        "is_reask": outcome.is_reask,
         "outcome": outcome.outcome,
         "answer_text": outcome.answer,
         "clarify_question": outcome.clarify_question,
@@ -315,6 +452,40 @@ async def step_for_outcome(services: Services, user: UserRef, outcome: SearchOut
         "created_at": datetime.now(UTC),
     }
     return step_payload(row, titles)
+
+
+async def delete_thread(services: Services, user: UserRef, thread_id: str) -> bool:
+    async with services.tx(user) as conn:
+        rows = await (
+            await conn.execute(
+                """
+                UPDATE search_logs
+                SET deleted_at = now()
+                WHERE (id = %s::uuid OR parent_search_id = %s::uuid)
+                  AND deleted_at IS NULL
+                RETURNING id::text AS id
+                """,
+                (thread_id, thread_id),
+            )
+        ).fetchall()
+    return bool(rows)
+
+
+async def restore_thread(services: Services, user: UserRef, thread_id: str) -> bool:
+    async with services.tx(user) as conn:
+        rows = await (
+            await conn.execute(
+                """
+                UPDATE search_logs
+                SET deleted_at = NULL
+                WHERE (id = %s::uuid OR parent_search_id = %s::uuid)
+                  AND deleted_at IS NOT NULL
+                RETURNING id::text AS id
+                """,
+                (thread_id, thread_id),
+            )
+        ).fetchall()
+    return bool(rows)
 
 
 # ---------- 边问边浮现 ----------
@@ -354,7 +525,13 @@ async def recall(services: Services, user: UserRef, query: str, *, limit: int = 
             await conn.execute(
                 """
                 WITH toks AS (SELECT unnest(%(toks)s::text[]) AS tok),
-                recent AS (SELECT msg_seq, lower(content) AS c FROM raw_messages ORDER BY msg_seq DESC LIMIT %(scan)s),
+                recent AS (
+                  SELECT msg_seq, lower(content) AS c
+                  FROM raw_messages
+                  WHERE deleted_at IS NULL
+                  ORDER BY msg_seq DESC
+                  LIMIT %(scan)s
+                ),
                 hits AS (SELECT r.msg_seq, t.tok FROM recent r JOIN toks t ON strpos(r.c, t.tok) > 0),
                 live AS (SELECT count(DISTINCT tok) AS n FROM hits)
                 SELECT h.msg_seq
@@ -383,8 +560,10 @@ def clean_item(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip(" -*·;；,，")
 
 
-def parse_memory(text: str) -> list[dict]:
+def parse_memory(text: str, deleted_seqs: set[int] | None = None) -> list[dict]:
     """MEMORY.md 的二级标题是分组，列表项是条目；开头的说明段落不展示。"""
+    if deleted_seqs:
+        text = retriever.strip_deleted_anchor_lines(text or "", deleted_seqs)
     sections: list[dict] = []
     current: dict | None = None
     for line in (text or "").splitlines():
@@ -406,9 +585,11 @@ def parse_memory(text: str) -> list[dict]:
     return [s for s in sections if s["items"]]
 
 
-def page_highlights(text: str, limit: int = 2) -> list[str]:
+def page_highlights(text: str, limit: int = 2, *, deleted_seqs: set[int] | None = None) -> list[str]:
     """主题页里已确认的前几条，作为近况卡片的摘要。"""
     _, body = split_frontmatter(text or "")
+    if deleted_seqs:
+        body = retriever.strip_deleted_anchor_lines(body, deleted_seqs)
     picked: list[str] = []
     for line in body.splitlines():
         match = _BULLET_RE.match(line)
@@ -433,9 +614,11 @@ async def note_stats(conn: AsyncConnection, user: UserRef) -> dict[str, Any]:
     row = await (
         await conn.execute(
             """
-            SELECT count(*) AS notes, count(*) FILTER (WHERE dream_status = 'pending') AS pending,
+            SELECT count(*) AS notes,
+                   count(*) FILTER (WHERE dream_status = 'pending') AS pending,
                    (SELECT last_dream_at FROM users WHERE id = %s) AS last_dream_at
             FROM raw_messages
+            WHERE deleted_at IS NULL
             """,
             (user.id,),
         )
@@ -450,6 +633,12 @@ async def note_stats(conn: AsyncConnection, user: UserRef) -> dict[str, Any]:
 async def context(services: Services, user: UserRef, *, page_limit: int = 8) -> dict:
     async with services.tx(user) as conn:
         stats = await note_stats(conn, user)
+        deleted_seqs = {
+            int(r["msg_seq"])
+            for r in await (
+                await conn.execute("SELECT msg_seq FROM raw_messages WHERE deleted_at IS NOT NULL")
+            ).fetchall()
+        }
         pages = await (
             await conn.execute(
                 "SELECT doc_path, page_title, page_type FROM wiki_pages ORDER BY file_mtime DESC LIMIT %s",
@@ -459,12 +648,14 @@ async def context(services: Services, user: UserRef, *, page_limit: int = 8) -> 
     root = services.settings.nas_root / user.workspace_rel_path
     memory_text = await asyncio.to_thread(_read, root / MEMORY_FILE)
     page_texts = await asyncio.gather(*[asyncio.to_thread(_read, root / p["doc_path"]) for p in pages])
+    page_cards = []
+    for p, text in zip(pages, page_texts):
+        highlights = page_highlights(text, deleted_seqs=deleted_seqs)
+        if highlights or not deleted_seqs:
+            page_cards.append({"title": p["page_title"], "type": p["page_type"], "highlights": highlights})
     return {
-        "sections": parse_memory(memory_text),
-        "pages": [
-            {"title": p["page_title"], "type": p["page_type"], "highlights": page_highlights(text)}
-            for p, text in zip(pages, page_texts)
-        ],
+        "sections": parse_memory(memory_text, deleted_seqs=deleted_seqs),
+        "pages": page_cards,
         "stats": stats,
     }
 

@@ -17,14 +17,14 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Path as PathParam, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from percolation import graph
 from percolation.agents import dream, search
-from percolation.capture import capture
+from percolation.capture import capture, delete_messages, restore_messages, revise
 from percolation.product import views
 from percolation.product.identity import Account, AuthUnavailable, StarPageAuth
 from percolation.product.settings import WebSettings, load_web_settings
@@ -123,8 +123,17 @@ class CaptureIn(BaseModel):
     client_meta: dict[str, Any] = Field(default_factory=dict)
 
 
+class NoteReviseIn(BaseModel):
+    content: str = Field(min_length=1, max_length=20000)
+
+
+class NoteBatchIn(BaseModel):
+    seqs: list[int] = Field(min_length=1, max_length=500)
+
+
 class SearchIn(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
+    reask_of: str | None = None
 
 
 class ClarifyIn(BaseModel):
@@ -188,9 +197,64 @@ async def capture_endpoint(
     user: UserRef = Depends(get_user),
     web: WebSettings = Depends(get_web),
 ) -> dict:
+    text = body.content.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="内容不能为空")
     await _check_quota(services, user, "captures", web)
-    captured = await capture(services, user, body.content.strip(), client_meta=body.client_meta)
+    captured = await capture(services, user, text, client_meta=body.client_meta)
     return {**captured, "note": await views.get_note(services, user, captured["msg_seq"])}
+
+
+@app.patch("/v1/notes/{seq}")
+async def revise_note_endpoint(
+    body: NoteReviseIn,
+    seq: int = PathParam(ge=1),
+    services: Services = Depends(get_services),
+    user: UserRef = Depends(get_user),
+) -> dict:
+    text = body.content.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="内容不能为空")
+    try:
+        await revise(services, user, seq, text)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "note": await views.get_note(services, user, seq),
+        "revisions": await views.list_note_revisions(services, user, seq) or [],
+    }
+
+
+@app.get("/v1/notes/{seq}/revisions")
+async def note_revisions_endpoint(
+    seq: int = PathParam(ge=1),
+    services: Services = Depends(get_services),
+    user: UserRef = Depends(get_user),
+) -> dict:
+    revs = await views.list_note_revisions(services, user, seq)
+    if revs is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    return {"revisions": revs}
+
+
+@app.post("/v1/notes/delete")
+async def delete_notes_endpoint(
+    body: NoteBatchIn,
+    services: Services = Depends(get_services),
+    user: UserRef = Depends(get_user),
+) -> dict:
+    deleted = await delete_messages(services, user, body.seqs)
+    return {"deleted": deleted}
+
+
+@app.post("/v1/notes/restore")
+async def restore_notes_endpoint(
+    body: NoteBatchIn,
+    services: Services = Depends(get_services),
+    user: UserRef = Depends(get_user),
+) -> dict:
+    restored = await restore_messages(services, user, body.seqs)
+    return {"restored": restored, "notes": await views.get_notes(services, user, restored)}
 
 
 @app.post("/v1/search")
@@ -200,9 +264,20 @@ async def search_endpoint(
     user: UserRef = Depends(get_user),
     web: WebSettings = Depends(get_web),
 ) -> dict:
+    query = body.query.strip()
+    if not query:
+        raise HTTPException(status_code=422, detail="提问不能为空")
+    reask_of = body.reask_of
+    if reask_of is not None:
+        try:
+            reask_of = str(uuid.UUID(reask_of))
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="检索记录不存在") from exc
     await _check_quota(services, user, "asks", web)
     try:
-        outcome = await search.ask(services, user, body.query.strip())
+        outcome = await search.ask(services, user, query, reask_of=reask_of)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         log.exception("search failed for %s", user.slug)
         raise HTTPException(status_code=502, detail="这次没能完成，请稍后再试") from exc
@@ -284,6 +359,32 @@ async def threads_endpoint(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="before_id 不是合法的 id") from exc
     return await views.list_threads(services, user, before_id=before_id, limit=limit)
+
+
+@app.post("/v1/threads/{thread_id}/delete")
+async def delete_thread_endpoint(
+    thread_id: str,
+    services: Services = Depends(get_services),
+    user: UserRef = Depends(get_user),
+) -> dict:
+    try:
+        tid = str(uuid.UUID(thread_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="问答记录不存在") from exc
+    return {"ok": await views.delete_thread(services, user, tid)}
+
+
+@app.post("/v1/threads/{thread_id}/restore")
+async def restore_thread_endpoint(
+    thread_id: str,
+    services: Services = Depends(get_services),
+    user: UserRef = Depends(get_user),
+) -> dict:
+    try:
+        tid = str(uuid.UUID(thread_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="问答记录不存在") from exc
+    return {"ok": await views.restore_thread(services, user, tid)}
 
 
 @app.get("/v1/recall")

@@ -23,6 +23,8 @@
     close: '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 3l6 6M9 3L3 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
   };
 
+  const UNDO_MS = 6000;
+
   const MODES = {
     cap: { input: "cap-in", panel: "panel-left", stream: "left-stream", max: 20000 },
     ask: { input: "ask-in", panel: "panel-right", stream: "right-stream", max: 2000 },
@@ -64,6 +66,15 @@
     loginShown: false,
     find: null,
     lastFind: "",
+    editing: null,
+    hold: null,
+    picking: false,
+    picked: {},
+    undo: null,
+    hoverSeq: null,
+    openRev: null,
+    revCache: {},
+    reask: null,
   };
 
   let localSeq = 0;
@@ -200,7 +211,18 @@
   }
 
   function normNote(n) {
-    return { seq: n.seq, content: n.content, at: Date.parse(n.at), status: n.status, kind: n.kind, state: null };
+    return {
+      seq: n.seq,
+      content: n.content,
+      at: Date.parse(n.at),
+      status: n.status,
+      kind: n.kind,
+      editedAt: n.edited_at ? Date.parse(n.edited_at) : null,
+      revisions: n.revisions || 0,
+      everArchived: !!n.ever_archived,
+      cited: n.cited || 0,
+      state: null,
+    };
   }
 
   function normThread(t) {
@@ -281,6 +303,9 @@
       '<div class="find-bar" role="search">' +
       ICON.find +
       '<input id="find-in" type="search" placeholder="在记录里找原话" maxlength="200" autocomplete="off" enterkeyhint="search" aria-label="在记录里找原话" tabindex="-1" />' +
+      '<button type="button" class="find-tool" data-act="find-pick" data-keep-focus tabindex="-1">选择</button>' +
+      '<button type="button" class="find-tool" data-act="find-all" data-keep-focus tabindex="-1">全选命中</button>' +
+      '<button type="button" class="find-tool danger" data-act="find-del" data-keep-focus tabindex="-1">删除</button>' +
       '<span class="find-count" aria-live="polite"></span>' +
       '<button class="find-close" data-act="find-close" title="收起（Esc）" aria-label="收起搜索" tabindex="-1">' +
       ICON.close +
@@ -365,7 +390,36 @@
     return html + esc(text.slice(at));
   }
 
+  function editHintHtml(n) {
+    const lines = [];
+    if (n.everArchived) lines.push("这句已融入你的近况，改动今晚同步");
+    if (n.cited > 0) lines.push("它是 " + n.cited + " 个回答的依据");
+    return lines.length ? '<div class="edit-hint">' + lines.map(esc).join("<br/>") + "</div>" : "";
+  }
+
+  function revHtml(n) {
+    if (ui.openRev !== n.seq) return "";
+    const revs = ui.revCache[n.seq];
+    if (!revs) return '<div class="rev-pop"><div class="rev-row faint">正在翻看…</div></div>';
+    if (!revs.length) return '<div class="rev-pop"><div class="rev-row faint">没有更早的版本</div></div>';
+    return (
+      '<div class="rev-pop">' +
+      revs
+        .map((r) => '<div class="rev-row"><s>' + esc(r.prev) + "</s><time>" + clock(Date.parse(r.at)) + "</time></div>")
+        .join("") +
+      "</div>"
+    );
+  }
+
   function noteHtml(n, terms) {
+    if (n.tomb) {
+      return (
+        '<div class="note tomb" data-note-seq="' +
+        n.seq +
+        '"><span class="tomb-line">已删除 · <button type="button" data-undo>撤销</button></span></div>'
+      );
+    }
+    const editing = ui.editing && ui.editing.seq === n.seq;
     const cls = ["note"];
     if (n.state === "sending") cls.push("sending");
     else if (n.state === "failed") cls.push("failed");
@@ -375,34 +429,73 @@
     if (n.hit) cls.push("hit");
     if (n.near) cls.push("near");
     if (n.hit === false) cls.push("ctx");
+    if (editing) cls.push("editing");
+    if (ui.hold && ui.hold.kind === "note" && ui.hold.id === n.seq) cls.push("held");
+    if (ui.picking && n.hit) cls.push("pickable");
+    if (ui.picked[n.seq]) cls.push("picked");
     const attr = n.seq ? ' data-note-seq="' + n.seq + '"' : ' data-note-local="' + n.local + '"';
     let tag = n.kind === "clarification" ? '<span class="note-tag">补充</span>' : "";
     if (n.near) tag += '<span class="note-tag near-tag">相近</span>';
     const time = '<time class="note-time" title="' + (n.status === "pending" ? "今晚凝练" : "已凝练") + '">' + clock(n.at) + "</time>";
-    const tail =
-      n.state === "failed"
-        ? '<button class="note-retry" data-retry-note="' + n.local + '">重试</button>'
-        : n.hit
-          ? '<span class="note-side">' + time + '<span class="note-go">定位</span></span>'
-          : time;
+    const body = editing
+      ? '<textarea class="note-edit" maxlength="20000" rows="1">' + esc(ui.editing.text) + "</textarea>" + editHintHtml(n)
+      : tag + (n.near ? esc(n.content) : markTerms(n.content, terms)) + revHtml(n);
+    let tail;
+    if (n.state === "failed") {
+      tail = '<button class="note-retry" data-retry-note="' + n.local + '">重试</button>';
+    } else if (ui.picking && n.hit) {
+      tail = '<button type="button" class="pick' + (ui.picked[n.seq] ? " on" : "") + '" data-pick="' + n.seq + '" aria-label="选择"></button>';
+    } else {
+      const hover =
+        n.seq && n.state !== "sending"
+          ? '<span class="note-hover"><button type="button" data-note-edit="' +
+            n.seq +
+            '" title="编辑">改</button><button type="button" data-note-del="' +
+            n.seq +
+            '" title="删除">删</button>' +
+            (n.hit ? '<span class="note-go">定位</span>' : "") +
+            "</span>"
+          : "";
+      const rev =
+        n.revisions > 0
+          ? '<button type="button" class="note-rev' + (ui.openRev === n.seq ? " on" : "") + '" data-rev="' + n.seq + '" title="看改过的原话">已改</button>'
+          : "";
+      tail = '<span class="note-side">' + rev + '<span class="note-slot">' + time + hover + "</span></span>";
+    }
+    const hold =
+      ui.hold && ui.hold.kind === "note" && ui.hold.id === n.seq
+        ? '<div class="hold-bar"><button type="button" data-note-edit="' +
+          n.seq +
+          '">编辑</button><button type="button" data-note-copy="' +
+          n.seq +
+          '">复制</button><button type="button" class="danger" data-note-del="' +
+          n.seq +
+          '">删除</button></div>'
+        : "";
     return (
       '<div class="' +
       cls.join(" ") +
       '"' +
       attr +
-      (n.hit ? ' data-locate="' + n.seq + '" title="定位到原处"' : "") +
+      (n.hit && !editing && !ui.picking ? ' data-locate="' + n.seq + '" title="定位到原处"' : "") +
       '><span class="note-dot"></span><span class="note-body">' +
-      tag +
-      (n.near ? esc(n.content) : markTerms(n.content, terms)) +
+      body +
       "</span>" +
       tail +
+      hold +
       "</div>"
     );
   }
 
   function notesHtml() {
     if (!S.ready) return "";
-    if (!S.notes.length) return capEmptyHtml();
+    const orphanUndo =
+      !findActive() && ui.undo && ui.undo.kind === "notes" && !S.notes.some((n) => n.tomb)
+        ? '<div class="note tomb orphan-undo"><span class="tomb-line">已删除 ' +
+          (ui.undo.ids.length > 1 ? ui.undo.ids.length + " 条" : "") +
+          ' · <button type="button" data-undo>撤销</button></span></div>'
+        : "";
+    if (!S.notes.length) return orphanUndo || capEmptyHtml();
     let html = '<div class="stream-spacer"></div>';
     let lastDay = null;
     for (const n of S.notes) {
@@ -414,25 +507,40 @@
       }
       html += noteHtml(n);
     }
-    return html + "</div>";
+    return html + "</div>" + orphanUndo;
   }
 
   // anchor：重绘前后让这条记录停在屏幕上同一位置（展开折叠时用）
   function paintNotes(opt = {}) {
     const box = el.leftStream;
-    const stick = opt.bottom || nearBottom(box);
+    const stick = !opt.keepScroll && (opt.bottom || nearBottom(box));
+    const prevTop = box.scrollTop;
     const fromBottom = box.scrollHeight - box.scrollTop;
     const anchorSel = opt.anchor ? '[data-note-seq="' + opt.anchor + '"]' : null;
     const before = anchorSel && box.querySelector(anchorSel);
     const anchorTop = before ? before.getBoundingClientRect().top : 0;
+    const editor = document.activeElement && document.activeElement.classList.contains("note-edit") ? document.activeElement : null;
+    const caret = editor ? [editor.selectionStart, editor.selectionEnd] : null;
     box.innerHTML = findActive() ? findHtml() : notesHtml();
     const after = anchorSel && box.querySelector(anchorSel);
     if (before && after) box.scrollTop += after.getBoundingClientRect().top - anchorTop;
     else if (opt.keepOffset) box.scrollTop = box.scrollHeight - fromBottom;
+    else if (opt.keepScroll) box.scrollTop = prevTop;
     else if (stick) box.scrollTop = box.scrollHeight;
+    else box.scrollTop = prevTop;
     S.notes.forEach((n) => (n.enter = false));
     if (ui.find) ui.find.items.forEach((n) => (n.enter = false));
+    const ta = box.querySelector(".note-edit");
+    if (ta) {
+      autosizeNote(ta);
+      if (caret) {
+        ta.focus({ preventScroll: true });
+        ta.setSelectionRange(caret[0], caret[1]);
+      }
+    }
+    el.app.classList.toggle("holding", !!ui.hold);
     paintCapMeta();
+    paintFindChrome();
   }
 
   function paintCapMeta() {
@@ -485,6 +593,322 @@
     }
   }
 
+  /* ───────── 改与删 ───────── */
+  // 编辑在原位置完成；删除不弹确认，原地收成一道虚线，6 秒内可撤销。
+  // 撤销窗口结束前只是软删除，夜间整理才会从记忆里抹掉原文。
+
+  function notesBySeq(seq) {
+    const out = [];
+    for (const n of S.notes) if (n.seq === seq) out.push(n);
+    if (ui.find) for (const n of ui.find.items) if (n.seq === seq && out.indexOf(n) === -1) out.push(n);
+    return out;
+  }
+
+  function autosizeNote(ta) {
+    ta.style.height = "0px";
+    ta.style.height = Math.min(Math.max(ta.scrollHeight, 24), 220) + "px";
+  }
+
+  function finishUndo() {
+    const pending = ui.undo;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    ui.undo = null;
+    if (pending.kind === "notes") {
+      const drop = new Set(pending.ids);
+      S.notes = S.notes.filter((n) => !drop.has(n.seq));
+      if (ui.find) ui.find.items = ui.find.items.filter((n) => !drop.has(n.seq));
+    } else {
+      S.threads = S.threads.filter((t) => pending.ids.indexOf(t.id) === -1);
+    }
+  }
+
+  function armUndo(pending) {
+    finishUndo();
+    pending.timer = setTimeout(() => {
+      if (ui.undo !== pending) return;
+      finishUndo();
+      paintNotes({ keepScroll: true });
+      paintThreads({ keepScroll: true });
+    }, UNDO_MS);
+    ui.undo = pending;
+  }
+
+  function clearLocalChrome() {
+    if (ui.undo) {
+      clearTimeout(ui.undo.timer);
+      ui.undo = null;
+    }
+    ui.editing = null;
+    ui.hold = null;
+    ui.picking = false;
+    ui.picked = {};
+    ui.openRev = null;
+    ui.reask = null;
+  }
+
+  function retargetAnswers(seqs, mode, bySeq) {
+    const set = new Set(seqs);
+    for (const thread of S.threads) {
+      for (const step of thread.steps || []) {
+        const cited = step.seqs || [];
+        const hasReply = step.reply && set.has(step.reply.seq);
+        if (!cited.some((s) => set.has(s)) && !(step.deleted_seqs || []).some((s) => set.has(s)) && !hasReply) continue;
+        if (mode === "updated") {
+          step.updated_seqs = Array.from(new Set([...(step.updated_seqs || []), ...cited.filter((s) => set.has(s))]));
+          if (hasReply && bySeq && bySeq[step.reply.seq]) step.reply.content = bySeq[step.reply.seq].content;
+        } else if (mode === "deleted") {
+          step.deleted_seqs = Array.from(new Set([...(step.deleted_seqs || []), ...cited.filter((s) => set.has(s))]));
+          step.updated_seqs = (step.updated_seqs || []).filter((s) => !set.has(s));
+          if (hasReply) step.reply.deleted = true;
+        } else if (mode === "restored") {
+          step.deleted_seqs = (step.deleted_seqs || []).filter((s) => !set.has(s));
+          if (bySeq) {
+            const stepAt = step.at ? Date.parse(step.at) : 0;
+            const revBack = cited.filter((s) => {
+              const n = set.has(s) && bySeq[s];
+              return n && n.editedAt && stepAt && n.editedAt > stepAt;
+            });
+            if (revBack.length) step.updated_seqs = Array.from(new Set([...(step.updated_seqs || []), ...revBack]));
+            if (hasReply) {
+              step.reply.deleted = false;
+              if (bySeq[step.reply.seq]) step.reply.content = bySeq[step.reply.seq].content;
+            }
+          } else if (hasReply) {
+            step.reply.deleted = false;
+          }
+        }
+      }
+    }
+  }
+
+  function mergeNote(raw) {
+    const note = normNote(raw);
+    let inStream = false;
+    for (const n of notesBySeq(note.seq)) {
+      const keep = { hit: n.hit, near: n.near, pos: n.pos, tomb: false, enter: n.enter };
+      Object.assign(n, note, keep);
+      if (S.notes.indexOf(n) !== -1) inStream = true;
+    }
+    if (!inStream) {
+      const oldest = oldestSeq();
+      if (!S.notesMore || oldest == null || note.seq >= oldest) {
+        note.enter = true;
+        S.notes.push(note);
+        S.notes.sort((a, b) => (a.seq || Infinity) - (b.seq || Infinity));
+      }
+    }
+    if (raw && ui.editing && ui.editing.seq === note.seq) ui.editing = null;
+  }
+
+  function startEdit(seq) {
+    const note = notesBySeq(seq).find((n) => !n.tomb && n.state !== "sending");
+    if (!note || !ensureReady()) return;
+    ui.hold = null;
+    ui.openRev = null;
+    ui.editing = { seq, text: note.content, saving: false };
+    paintNotes({ keepScroll: true });
+    const ta = el.leftStream.querySelector(".note-edit");
+    if (ta) {
+      autosizeNote(ta);
+      ta.focus({ preventScroll: true });
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }
+  }
+
+  function cancelEdit() {
+    if (!ui.editing) return;
+    ui.editing = null;
+    paintNotes({ keepScroll: true });
+  }
+
+  async function saveEdit() {
+    const editing = ui.editing;
+    if (!editing || editing.saving) return;
+    const text = editing.text.trim();
+    const note = notesBySeq(editing.seq).find((n) => !n.tomb);
+    if (!text || (note && text === note.content)) return cancelEdit();
+    editing.saving = true;
+    try {
+      const res = await api("v1/notes/" + editing.seq, { method: "PATCH", body: { content: text } });
+      ui.revCache[editing.seq] = res.revisions || [];
+      ui.editing = null;
+      mergeNote(res.note);
+      retargetAnswers([editing.seq], "updated", { [editing.seq]: normNote(res.note) });
+      S.ctxAt = 0;
+      paintNotes({ keepScroll: true });
+      paintThreads({ keepScroll: true });
+      const dot = el.leftStream.querySelector('[data-note-seq="' + editing.seq + '"] .note-dot');
+      percolate(dot, $(isMobile() ? ".panel-right .peek-dot" : ".panel-right .title-dot"));
+    } catch (err) {
+      editing.saving = false;
+      toast(err.message);
+    }
+  }
+
+  async function toggleRev(seq) {
+    if (ui.openRev === seq) {
+      ui.openRev = null;
+      paintNotes({ keepScroll: true });
+      return;
+    }
+    ui.openRev = seq;
+    ui.hold = null;
+    paintNotes({ keepScroll: true });
+    if (ui.revCache[seq]) return;
+    try {
+      const res = await api("v1/notes/" + seq + "/revisions");
+      ui.revCache[seq] = res.revisions || [];
+      if (ui.openRev === seq) paintNotes({ keepScroll: true });
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
+  async function copyNote(seq) {
+    const note = notesBySeq(seq)[0];
+    ui.hold = null;
+    paintNotes({ keepScroll: true });
+    if (!note) return;
+    try {
+      await navigator.clipboard.writeText(note.content);
+      toast("已复制");
+    } catch (e) {
+      toast("没能复制");
+    }
+  }
+
+  function retreat(to) {
+    const from = $(isMobile() ? ".panel-right .peek-dot" : ".panel-right .title-dot");
+    if (!from || !to || calmMq.matches || !to.animate) return;
+    const a = from.getBoundingClientRect();
+    const b = to.getBoundingClientRect();
+    const x0 = a.left + a.width / 2;
+    const y0 = a.top + a.height / 2;
+    const x1 = b.left + b.width / 2;
+    const y1 = b.top + b.height / 2;
+    const cx = x1 - (x1 - x0) * 0.25;
+    const cy = Math.min(y0, y1) - 28;
+    const frames = [];
+    for (let i = 0; i <= 16; i++) {
+      const t = i / 16;
+      const u = 1 - t;
+      frames.push({
+        offset: t,
+        transform: "translate(" + (u * u * x0 + 2 * u * t * cx + t * t * x1).toFixed(1) + "px," + (u * u * y0 + 2 * u * t * cy + t * t * y1).toFixed(1) + "px) scale(" + (1 - 0.7 * t).toFixed(3) + ")",
+        opacity: t < 0.72 ? 1 : 1 - (t - 0.72) / 0.28,
+      });
+    }
+    const orb = document.createElement("span");
+    orb.className = "orb";
+    document.body.appendChild(orb);
+    const anim = orb.animate(frames, { duration: 640, easing: "cubic-bezier(0.4, 0, 0.2, 1)", fill: "both" });
+    anim.onfinish = () => orb.remove();
+  }
+
+  async function deleteNotes(seqs) {
+    seqs = Array.from(new Set(seqs.filter((s) => s)));
+    if (!seqs.length || !ensureReady()) return;
+    finishUndo();
+    if (ui.editing && seqs.indexOf(ui.editing.seq) !== -1) ui.editing = null;
+    ui.hold = null;
+    ui.picking = false;
+    ui.picked = {};
+    ui.openRev = null;
+    seqs.forEach((seq) => notesBySeq(seq).forEach((n) => (n.tomb = true)));
+    S.notesTotal = Math.max(0, S.notesTotal - seqs.length);
+    paintNotes({ keepScroll: true });
+    const tomb = el.leftStream.querySelector(".note.tomb .tomb-line");
+    retreat(tomb);
+    try {
+      const res = await api("v1/notes/delete", { method: "POST", body: { seqs } });
+      const deleted = new Set((res.deleted || []).map(Number));
+      const missed = seqs.filter((s) => !deleted.has(s));
+      missed.forEach((seq) => notesBySeq(seq).forEach((n) => (n.tomb = false)));
+      S.notesTotal += missed.length;
+      const gone = seqs.filter((s) => deleted.has(s));
+      if (gone.length) {
+        retargetAnswers(gone, "deleted");
+        armUndo({ kind: "notes", ids: gone });
+        S.ctxAt = 0;
+      }
+      paintNotes({ keepScroll: true });
+      paintThreads({ keepScroll: true });
+    } catch (err) {
+      seqs.forEach((seq) => notesBySeq(seq).forEach((n) => (n.tomb = false)));
+      S.notesTotal += seqs.length;
+      paintNotes({ keepScroll: true });
+      toast(err.message);
+    }
+  }
+
+  async function undoDelete() {
+    const pending = ui.undo;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    ui.undo = null;
+    try {
+      if (pending.kind === "notes") {
+        const res = await api("v1/notes/restore", { method: "POST", body: { seqs: pending.ids } });
+        const bySeq = {};
+        const back = new Set();
+        for (const raw of res.notes || []) {
+          mergeNote(raw);
+          bySeq[raw.seq] = normNote(raw);
+          back.add(raw.seq);
+        }
+        S.notesTotal += (res.notes || []).length;
+        retargetAnswers(Array.from(back), "restored", bySeq);
+        const left = pending.ids.filter((id) => !back.has(id));
+        if (left.length) armUndo({ kind: "notes", ids: left });
+      } else {
+        const res = await api("v1/threads/" + pending.ids[0] + "/restore", { method: "POST" });
+        const thread = S.threads.find((t) => t.id === pending.ids[0]);
+        if (!res.ok) {
+          if (thread) armUndo(pending);
+        } else if (thread) {
+          thread.tomb = false;
+        }
+      }
+      S.ctxAt = 0;
+    } catch (err) {
+      toast(err.message);
+      if (pending.kind === "notes") {
+        const left = pending.ids.filter((id) => notesBySeq(id).some((n) => n.tomb));
+        if (left.length) armUndo({ kind: "notes", ids: left });
+      } else {
+        const thread = S.threads.find((t) => t.id === pending.ids[0] && t.tomb);
+        if (thread) armUndo(pending);
+      }
+    }
+    paintNotes({ keepScroll: true });
+    paintThreads({ keepScroll: true });
+  }
+
+  function togglePick(seq) {
+    if (ui.picked[seq]) delete ui.picked[seq];
+    else ui.picked[seq] = true;
+    paintNotes({ keepScroll: true });
+  }
+
+  function paintFindChrome() {
+    const tools = {
+      pick: $('.find-tool[data-act="find-pick"]'),
+      all: $('.find-tool[data-act="find-all"]'),
+      del: $('.find-tool[data-act="find-del"]'),
+    };
+    if (!tools.pick) return;
+    const hits = findHits();
+    const show = findActive() && hits.length > 0;
+    tools.pick.classList.toggle("on", show);
+    tools.pick.textContent = ui.picking ? "取消" : "选择";
+    const picked = Object.keys(ui.picked).length;
+    tools.all.classList.toggle("on", show && ui.picking);
+    tools.del.classList.toggle("on", show && ui.picking && picked > 0);
+    tools.del.textContent = picked > 1 ? "删除 " + picked + " 条" : "删除";
+    paintFindCount();
+  }
+
   /* ───────── 在记录里找 ───────── */
   // 结果是一条「折叠的时间线」：命中的原话按时间排开，中间没命中的收成一道可展开的折痕，
   // 找到一句话的同时还看得到它前后发生了什么。点命中的一条，收起搜索并定位到原处。
@@ -495,7 +919,7 @@
     return { q: "", terms: [], items: [], matched: 0, total: 0, capped: false, cur: -1, ctrl: null };
   }
 
-  const findHits = () => (ui.find ? ui.find.items.filter((n) => n.hit) : []);
+  const findHits = () => (ui.find ? ui.find.items.filter((n) => n.hit && !n.tomb) : []);
 
   function foldHtml(prev, next, count) {
     const label = !prev ? "更早 " + count + " 条" : !next ? "之后 " + count + " 条" : count + " 条";
@@ -536,7 +960,7 @@
   function findHtml() {
     const f = ui.find;
     const hits = findHits();
-    if (!hits.length) return findEmptyHtml(f);
+    if (!hits.length && !f.items.some((n) => n.tomb)) return findEmptyHtml(f);
     let html = '<div class="stream-spacer"></div><div class="find-list">';
     let prev = null;
     let lastDay = null;
@@ -559,12 +983,14 @@
     const f = ui.find;
     if (!f) return;
     const n = findHits().length;
-    el.findCount.textContent = !f.q ? "" : f.cur >= 0 && n ? f.cur + 1 + " / " + n : n + " 条";
+    const picked = Object.keys(ui.picked).length;
+    el.findCount.textContent = !f.q ? "" : ui.picking ? "已选 " + picked : f.cur >= 0 && n ? f.cur + 1 + " / " + n : n + " 条";
   }
 
   function setFindTabbable(on) {
     el.findIn.tabIndex = on ? 0 : -1;
     $(".find-close").tabIndex = on ? 0 : -1;
+    document.querySelectorAll(".find-tool").forEach((b) => (b.tabIndex = on ? 0 : -1));
   }
 
   function openFind() {
@@ -590,13 +1016,21 @@
     ui.lastFind = el.findIn.value.trim();
     const shown = findActive();
     ui.find = null;
+    ui.picking = false;
+    ui.picked = {};
     el.left.classList.remove("finding", "find-busy");
     setFindTabbable(false);
     if (document.activeElement === el.findIn) {
       if (opt.focusCap && !isMobile()) el.capIn.focus({ preventScroll: true });
       else el.findIn.blur();
     }
-    if (shown) paintNotes({ bottom: true });
+    if (shown) {
+      paintNotes({ bottom: true });
+      if (ui.undo && ui.undo.kind === "notes") {
+        const tomb = el.leftStream.querySelector(".note.tomb");
+        if (tomb) ensureVisible(tomb);
+      }
+    }
   }
 
   function scheduleFind(value, delay = 200) {
@@ -634,6 +1068,7 @@
         cur: -1,
         items: res.notes.map((r) => Object.assign(normNote(r), { pos: r.pos, near: r.near, hit: true, enter: true })),
       });
+      ui.picked = {};
       el.left.classList.remove("find-busy");
       paintNotes({ bottom: true });
       paintFindCount();
@@ -762,11 +1197,23 @@
     return text;
   }
 
-  function cuesHtml(step) {
-    if (!step.seqs || !step.seqs.length) return "";
-    const seqs = step.seqs.join(",");
-    const chips = ['<button class="cue cue-count" data-seqs="' + seqs + '">' + ICON.link + "依据 " + step.seqs.length + " 条记录</button>"];
-    for (const c of step.cues || []) chips.push('<button class="cue" data-seqs="' + seqs + '">' + esc(c) + "</button>");
+  function cuesHtml(step, thread) {
+    const seqs = step.seqs || [];
+    const deleted = step.deleted_seqs || [];
+    const updated = step.updated_seqs || [];
+    const live = seqs.filter((s) => deleted.indexOf(s) === -1);
+    if (!live.length && !deleted.length) return "";
+    const chips = [];
+    if (live.length) {
+      const joined = live.join(",");
+      chips.push('<button class="cue cue-count" data-seqs="' + joined + '">' + ICON.link + "依据 " + live.length + " 条记录</button>");
+      for (const c of step.cues || []) chips.push('<button class="cue" data-seqs="' + joined + '">' + esc(c) + "</button>");
+    }
+    if (deleted.length) chips.push('<span class="cue gone">依据已删除</span>');
+    if (updated.length && live.length && thread && thread.id) {
+      chips.push('<span class="cue stale">依据已更新</span>');
+      chips.push('<button type="button" class="cue reask" data-rerun="' + esc(thread.key) + '">重新问</button>');
+    }
     return '<div class="cues">' + chips.join("") + "</div>";
   }
 
@@ -791,14 +1238,59 @@
       const text = step.answer || (muted ? "没有找到相关记录。" : "");
       body = '<div class="a-text' + (muted ? " a-muted" : "") + '">' + formatRich(text) + "</div>";
     }
-    return answerHtml(body + cuesHtml(step));
+    return answerHtml(body + cuesHtml(step, t));
+  }
+
+  function questionHtml(t) {
+    if (ui.reask && ui.reask.key === t.key) {
+      return (
+        '<form class="reask-form" data-reask-form="' +
+        esc(t.key) +
+        '"><textarea class="reask-edit" maxlength="2000" rows="1">' +
+        esc(ui.reask.text) +
+        '</textarea><div class="edit-hint">Enter 重新问 · Esc 取消</div></form>'
+      );
+    }
+    if (!t.id || t.pending) return '<div class="q">' + esc(t.query) + "</div>";
+    const held = ui.hold && ui.hold.kind === "thread" && ui.hold.id === t.key;
+    return (
+      '<div class="q-wrap' +
+      (held ? " held" : "") +
+      '"><div class="q">' +
+      esc(t.query) +
+      '</div><div class="q-ops"><button type="button" data-reask="' +
+      esc(t.key) +
+      '">改了再问</button><button type="button" data-thread-del="' +
+      esc(t.key) +
+      '">删除</button></div>' +
+      (held
+        ? '<div class="hold-bar"><button type="button" data-reask="' +
+          esc(t.key) +
+          '">改了再问</button><button type="button" class="danger" data-thread-del="' +
+          esc(t.key) +
+          '">删除</button></div>'
+        : "") +
+      "</div>"
+    );
   }
 
   function threadHtml(t) {
-    let html = '<div class="qa' + (t.enter ? " enter" : "") + '" data-thread="' + esc(t.key) + '"><div class="q">' + esc(t.query) + "</div>";
+    if (t.tomb) {
+      return (
+        '<div class="qa tomb" data-thread="' +
+        esc(t.key) +
+        '"><button type="button" class="tomb-line" data-undo>已删除这条问答 · 撤销</button></div>'
+      );
+    }
+    const lastReask = t.steps.reduce((acc, step, i) => (step.reask ? i : acc), -1);
+    const hidePast = lastReask > 0 && !t.showPast;
+    let html = '<div class="qa' + (t.enter ? " enter" : "") + '" data-thread="' + esc(t.key) + '">' + questionHtml(t);
+    if (hidePast) html += '<button type="button" class="past-toggle" data-past="' + esc(t.key) + '">之前的回答</button>';
     t.steps.forEach((step, i) => {
+      if (hidePast && i < lastReask) return;
+      if (step.reask && step.query && step.query !== t.query) html += '<div class="q q-reask">' + esc(step.query) + "</div>";
       html += stepHtml(t, step, i === t.steps.length - 1);
-      if (step.reply) html += '<div class="q q-reply">' + esc(step.reply.content) + "</div>";
+      if (step.reply && !step.reply.deleted) html += '<div class="q q-reply">' + esc(step.reply.content) + "</div>";
     });
     if (t.pending) {
       html += answerHtml(
@@ -820,14 +1312,19 @@
 
   function paintThreads(opt = {}) {
     const box = el.rightStream;
-    const stick = opt.bottom || nearBottom(box);
+    const stick = !opt.keepScroll && (opt.bottom || nearBottom(box));
+    const prevTop = box.scrollTop;
     const fromBottom = box.scrollHeight - box.scrollTop;
     const active = document.activeElement;
     const focusKey = active && active.closest && active.closest("form[data-clarify]") ? active.closest("form[data-clarify]").dataset.clarify : null;
     const caret = focusKey ? [active.selectionStart, active.selectionEnd] : null;
+    const reaskOn = active && active.classList && active.classList.contains("reask-edit");
+    const reaskCaret = reaskOn ? [active.selectionStart, active.selectionEnd] : null;
     box.innerHTML = threadsHtml();
     if (opt.keepOffset) box.scrollTop = box.scrollHeight - fromBottom;
+    else if (opt.keepScroll) box.scrollTop = prevTop;
     else if (stick) box.scrollTop = box.scrollHeight;
+    else box.scrollTop = prevTop;
     S.threads.forEach((t) => (t.enter = false));
     if (focusKey) {
       const input = box.querySelector('form[data-clarify="' + CSS.escape(focusKey) + '"] input');
@@ -836,6 +1333,12 @@
         input.setSelectionRange(caret[0], caret[1]);
       }
     }
+    const reask = box.querySelector(".reask-edit");
+    if (reask && reaskCaret) {
+      reask.focus({ preventScroll: true });
+      reask.setSelectionRange(reaskCaret[0], reaskCaret[1]);
+    }
+    el.app.classList.toggle("holding", !!ui.hold);
   }
 
   function threadByKey(key) {
@@ -1091,6 +1594,8 @@
   async function logout() {
     closeMenu();
     closeFind();
+    clearLocalChrome();
+    ui.revCache = {};
     ui.lastFind = "";
     el.findIn.value = "";
     try {
@@ -1340,6 +1845,88 @@
     }
   }
 
+  function startReask(thread, text) {
+    if (!thread || !thread.id || thread.pending) return;
+    ui.hold = null;
+    ui.reask = { key: thread.key, text: text != null ? text : thread.query };
+    paintThreads({ keepScroll: true });
+    const ta = el.rightStream.querySelector(".reask-edit");
+    if (ta) {
+      autosizeNote(ta);
+      ta.focus({ preventScroll: true });
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }
+  }
+
+  function submitReask() {
+    if (!ui.reask) return;
+    const thread = threadByKey(ui.reask.key);
+    const text = ui.reask.text.trim();
+    if (!thread || !text) {
+      ui.reask = null;
+      paintThreads({ keepScroll: true });
+      return;
+    }
+    doReask(thread, text);
+  }
+
+  async function doReask(thread, text) {
+    text = (text || "").trim();
+    if (!text || !thread || !thread.id || thread.pending || !ensureReady()) return;
+    const previous = thread.query;
+    ui.reask = null;
+    ui.hold = null;
+    thread.query = text;
+    thread.pending = true;
+    thread.error = null;
+    thread.startedAt = Date.now();
+    thread.showPast = false;
+    paintThreads({ bottom: true });
+    startThinkTicker();
+    try {
+      const res = await api("v1/search", { method: "POST", body: { query: text, reask_of: thread.id } });
+      thread.steps.push(res.step);
+      thread.pending = false;
+      paintThreads({ bottom: true });
+      afterAnswer(res.step);
+    } catch (err) {
+      thread.query = previous;
+      thread.pending = false;
+      thread.error = err.message;
+      paintThreads({ bottom: true });
+    }
+  }
+
+  async function deleteThread(thread) {
+    if (!thread) return;
+    ui.hold = null;
+    ui.reask = null;
+    if (!thread.id) {
+      finishUndo();
+      S.threads = S.threads.filter((t) => t !== thread);
+      paintThreads({ keepScroll: true });
+      return;
+    }
+    finishUndo();
+    thread.tomb = true;
+    paintThreads({ keepScroll: true });
+    retreat(el.rightStream.querySelector('[data-thread="' + CSS.escape(thread.key) + '"] .tomb-line'));
+    try {
+      const res = await api("v1/threads/" + thread.id + "/delete", { method: "POST" });
+      if (!res.ok) {
+        thread.tomb = false;
+        paintThreads({ keepScroll: true });
+        return;
+      }
+      armUndo({ kind: "threads", ids: [thread.id] });
+      paintThreads({ keepScroll: true });
+    } catch (err) {
+      thread.tomb = false;
+      paintThreads({ keepScroll: true });
+      toast(err.message);
+    }
+  }
+
   function afterAnswer(step) {
     ui.recallSeqs = [];
     applyRecall();
@@ -1503,9 +2090,26 @@
     else if (act === "reboot") boot();
     else if (act === "find") openFind();
     else if (act === "find-close") closeFind({ focusCap: true });
+    else if (act === "find-pick") {
+      if (!findActive()) return;
+      ui.picking = !ui.picking;
+      ui.picked = {};
+      ui.hold = null;
+      paintNotes({ keepScroll: true });
+    } else if (act === "find-all") {
+      const hits = findHits();
+      const allOn = hits.length > 0 && hits.every((n) => ui.picked[n.seq]);
+      ui.picked = {};
+      if (!allOn) hits.forEach((n) => (ui.picked[n.seq] = true));
+      paintNotes({ keepScroll: true });
+    } else if (act === "find-del") deleteNotes(Object.keys(ui.picked).map(Number));
   }
 
   root.addEventListener("click", (e) => {
+    if (swallowClick) {
+      swallowClick = false;
+      return;
+    }
     const actEl = e.target.closest("[data-act]");
     if (actEl) {
       handleAct(actEl.dataset.act);
@@ -1519,6 +2123,46 @@
     const go = e.target.closest("[data-go]");
     if (go && isMobile() && go.matches(".ws-title") && go.dataset.go === "cap" && ui.mode === "cap") return openFind();
     if (go) return switchTo(go.dataset.go);
+
+    if (e.target.closest("[data-undo]")) return undoDelete();
+
+    const editBtn = e.target.closest("[data-note-edit]");
+    if (editBtn) return startEdit(Number(editBtn.dataset.noteEdit));
+    const delBtn = e.target.closest("[data-note-del]");
+    if (delBtn) return deleteNotes([Number(delBtn.dataset.noteDel)]);
+    const copyBtn = e.target.closest("[data-note-copy]");
+    if (copyBtn) return copyNote(Number(copyBtn.dataset.noteCopy));
+    const revBtn = e.target.closest("[data-rev]");
+    if (revBtn) return toggleRev(Number(revBtn.dataset.rev));
+    const pickBtn = e.target.closest("[data-pick]");
+    if (pickBtn) return togglePick(Number(pickBtn.dataset.pick));
+    const reaskBtn = e.target.closest("[data-reask]");
+    if (reaskBtn) return startReask(threadByKey(reaskBtn.dataset.reask));
+    const threadDel = e.target.closest("[data-thread-del]");
+    if (threadDel) return deleteThread(threadByKey(threadDel.dataset.threadDel));
+    const pastBtn = e.target.closest("[data-past]");
+    if (pastBtn) {
+      const thread = threadByKey(pastBtn.dataset.past);
+      if (thread) thread.showPast = !thread.showPast;
+      paintThreads({ keepScroll: true });
+      return;
+    }
+    const rerun = e.target.closest("[data-rerun]");
+    if (rerun) {
+      const thread = threadByKey(rerun.dataset.rerun);
+      if (thread) doReask(thread, thread.query);
+      return;
+    }
+    if (ui.picking) {
+      const row = e.target.closest(".note.pickable[data-note-seq]");
+      if (row) return togglePick(Number(row.dataset.noteSeq));
+    }
+    if (ui.hold && !e.target.closest(".hold-bar")) {
+      ui.hold = null;
+      paintNotes({ keepScroll: true });
+      paintThreads({ keepScroll: true });
+      return;
+    }
 
     const ask = e.target.closest("[data-ask]");
     if (ask) return doAsk(ask.dataset.ask);
@@ -1580,6 +2224,39 @@
   root.addEventListener("input", (e) => {
     const form = e.target.closest("form[data-clarify]");
     if (form) ui.clarifyDrafts[form.dataset.clarify] = e.target.value;
+    if (e.target.classList.contains("note-edit") && ui.editing) {
+      ui.editing.text = e.target.value;
+      autosizeNote(e.target);
+    }
+    if (e.target.classList.contains("reask-edit") && ui.reask) {
+      ui.reask.text = e.target.value;
+      autosizeNote(e.target);
+    }
+  });
+
+  root.addEventListener("keydown", (e) => {
+    if (e.target.classList.contains("note-edit")) {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelEdit();
+      } else if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        saveEdit();
+      }
+    } else if (e.target.classList.contains("reask-edit")) {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        ui.reask = null;
+        paintThreads({ keepScroll: true });
+      } else if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        submitReask();
+      }
+    }
   });
 
   // 桌面端：光标落在哪一侧的输入框，哪一侧就成为主工作区
@@ -1593,9 +2270,111 @@
     if (e.target.closest("[data-keep-focus]")) e.preventDefault();
   });
 
+  // 手机长按：滑动留给记录/询问切换，所以改和删放在长按里。松手时的那一下点击要吃掉，避免误定位。
+  let swallowClick = false;
+  let press = null;
+
+  function pressTarget(target) {
+    if (!isMobile() || ui.picking || !target.closest) return null;
+    if (target.closest("button, input, textarea, a, form")) return null;
+    const note = target.closest(".note[data-note-seq]");
+    if (note && !note.classList.contains("tomb") && !note.classList.contains("editing")) {
+      return { kind: "note", id: Number(note.dataset.noteSeq) };
+    }
+    const qa = target.closest(".qa[data-thread]");
+    if (qa && !qa.classList.contains("tomb") && target.closest(".q, .q-wrap")) {
+      const thread = threadByKey(qa.dataset.thread);
+      if (thread && thread.id && !thread.pending) return { kind: "thread", id: thread.key };
+    }
+    return null;
+  }
+
+  function clearPress() {
+    if (!press) return;
+    clearTimeout(press.timer);
+    press = null;
+  }
+
+  root.addEventListener("pointerdown", (e) => {
+    if (e.button != null && e.button !== 0) return;
+    const hit = pressTarget(e.target);
+    if (!hit) return;
+    const start = { x: e.clientX, y: e.clientY, hit };
+    press = start;
+    start.timer = setTimeout(() => {
+      if (press !== start) return;
+      press = null;
+      swallowClick = true;
+      if (navigator.vibrate) navigator.vibrate(10);
+      ui.hold = start.hit;
+      ui.editing = null;
+      ui.reask = null;
+      paintNotes({ keepScroll: true });
+      paintThreads({ keepScroll: true });
+    }, 480);
+  });
+  root.addEventListener("pointermove", (e) => {
+    if (!press) return;
+    const dx = e.clientX - press.x;
+    const dy = e.clientY - press.y;
+    if (dx * dx + dy * dy > 100) clearPress();
+  });
+  root.addEventListener("pointerup", clearPress);
+  root.addEventListener("pointercancel", clearPress);
+  root.addEventListener("contextmenu", (e) => {
+    if (e.target.closest && e.target.closest(".note[data-note-seq], .qa")) e.preventDefault();
+  });
+  root.addEventListener("pointerover", (e) => {
+    const row = e.target.closest && e.target.closest(".note[data-note-seq]");
+    if (!row || row.classList.contains("tomb")) return;
+    ui.hoverSeq = Number(row.dataset.noteSeq);
+  });
+
   // 「/」打开找记录：焦点不在输入框里，或者记录输入框还是空的（记录很少以「/」开头）
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeMenu();
+    if (e.key === "Escape") {
+      if (ui.editing || ui.reask) return;
+      if (ui.hold) {
+        ui.hold = null;
+        paintNotes({ keepScroll: true });
+        paintThreads({ keepScroll: true });
+        return;
+      }
+      if (ui.openRev != null) {
+        ui.openRev = null;
+        paintNotes({ keepScroll: true });
+        return;
+      }
+      if (ui.picking) {
+        ui.picking = false;
+        ui.picked = {};
+        paintNotes({ keepScroll: true });
+        return;
+      }
+      closeMenu();
+      return;
+    }
+    if ((e.key === "e" || e.key === "E") && !e.repeat && !ui.loginShown) {
+      const t = e.target;
+      const typing = t && t.matches && t.matches("textarea, input");
+      if (typing) {
+        if (t === el.findIn && (e.altKey || e.metaKey || e.ctrlKey) && !e.isComposing) {
+          const hit = ui.find && ui.find.cur >= 0 ? findHits()[ui.find.cur] : null;
+          if (hit) {
+            e.preventDefault();
+            startEdit(hit.seq);
+          }
+        }
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return;
+      const cur = findActive() && ui.find.cur >= 0 ? findHits()[ui.find.cur] : null;
+      const seq = cur ? cur.seq : ui.hoverSeq;
+      if (!seq) return;
+      e.preventDefault();
+      startEdit(seq);
+      return;
+    }
     if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey || e.isComposing || ui.loginShown || isMobile()) return;
     const t = e.target;
     const typing = t && t.matches && t.matches("textarea, input");
@@ -1642,6 +2421,8 @@
 
   async function loadAll() {
     const [n, t] = await Promise.all([api("v1/notes?limit=80"), api("v1/threads?limit=20")]);
+    clearLocalChrome();
+    ui.revCache = {};
     S.notes = n.notes.map(normNote);
     S.notesTotal = n.total != null ? n.total : S.notes.length;
     S.notesMore = n.has_more;

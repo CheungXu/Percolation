@@ -43,9 +43,19 @@ SELECT capture_message('随手记的一句话');
 
 `sp-` 租户不在 `tenants.drop_tenant` 的允许范围内。确需删除（如测试账号）时，用建表账号按「临时租户」一节的同样步骤手工删，删完要 `systemctl restart percolation-api`：接口进程里缓存了 slug 到租户 id 的映射。
 
+## 修订与删除（006）
+
+`006_revisions_and_lifecycle.sql` 让原话可以改、可以删，但仍然不能靠裸 `UPDATE` / `DELETE`：
+
+- `raw_messages` 增加 `edited_at`、`revision_count`、`ever_archived`、`deleted_at`、`purged_at`。内容为空只允许出现在已抹除的占位行上。运行角色只对 `ever_archived` 有列级 UPDATE，正文和其余生命周期列只能经受控函数改。
+- `raw_message_revisions` 按序号记下每次修改的旧文和新文。抹除时连修订一起删掉；行本身仍在（序号占位），所以不会出现物理 `DELETE`。
+- 触发器 `raw_messages_guard`：禁止 `DELETE`；已抹除的占位行不能再改；身份列和录入元数据不能改；改正文或生命周期列时，事务里必须先 `set_config('app.raw_mutation','allowed',true)`。这个开关只在下面四个 `SECURITY DEFINER` 函数里打开。
+- `revise_message`：正文有变化才记一版，并把 `dream_status` 置回 `pending`。`delete_messages` / `restore_messages` 是软删除和撤销（已抹除的不能恢复）。`purge_messages` 把正文清空、`dream_status` 标 `skipped`，并删掉该序号的修订。
+- 软删除和「改过且尚未再次整理」的原话都会让 `users.dirty_since` 保持非空，夜间整理因此看得到它们。列表、检索用的部分索引排除已删除行。
+
 ## 执行记录
 
-`000_extensions.sql`、`001_init.sql`、`002_dream_queue.sql` 已在 2026-11-12 执行；`003_wiki_facets_and_graph.sql`（多维节点/维度倒排/事件日期/类型链接边与强制 RLS）、`004_workspace_head.sql` 已在 2026-11-13 执行（幂等脚本），`004` 之后已回填全部 2 个用户。`005_product_web.sql` 已在 2026-11-15 执行（幂等）。`001` 不要重复执行。
+`000_extensions.sql`、`001_init.sql`、`002_dream_queue.sql` 已在 2026-11-12 执行；`003_wiki_facets_and_graph.sql`（多维节点/维度倒排/事件日期/类型链接边与强制 RLS）、`004_workspace_head.sql` 已在 2026-11-13 执行（幂等脚本），`004` 之后已回填全部 2 个用户。`005_product_web.sql` 已在 2026-11-15 执行（幂等）。`006_revisions_and_lifecycle.sql` 已在 2026-11-17 由本仓库的代理用 `config/db.env` 里的建表账号执行（幂等，执行了两次）。`001` 不要重复执行。
 
 ## 临时租户
 

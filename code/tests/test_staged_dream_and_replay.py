@@ -154,7 +154,7 @@ def test_env_digest_ignores_watermark():
     assert env_anchor.env_digest(base) == env_anchor.env_digest(later)
     assert env_anchor.env_digest(base) != env_anchor.env_digest({**base, "config": {"models_json": "z"}})
     code = env_anchor.code_env(ROOT)
-    assert code["code_digest"] and code["migration"] == "005_product_web.sql"
+    assert code["code_digest"] and code["migration"] == "006_revisions_and_lifecycle.sql"
 
 
 def test_ensure_published_cases(tmp_path):

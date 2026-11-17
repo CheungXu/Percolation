@@ -112,6 +112,7 @@ class SearchOutcome:
     outcome: str
     route_path: str
     answer: str
+    query: str = ""
     clarify_question: str = ""
     verified_msg_seqs: list[int] = field(default_factory=list)
     hit_doc_paths: list[str] = field(default_factory=list)
@@ -124,6 +125,7 @@ class SearchOutcome:
     cost_cny: float = 0.0
     trace_id: str = ""
     parent_search_id: str | None = None
+    is_reask: bool = False
 
     def as_dict(self) -> dict:
         data = asdict(self)
@@ -211,9 +213,24 @@ async def ask(
     clarification: str | None = None,
     as_of: datetime | None = None,
     parent_search_id: str | None = None,
+    reask_of: str | None = None,
 ) -> SearchOutcome:
-    """as_of 只在复现时传：把「当前日期」钉在原运行的时刻。parent_search_id 是澄清重查所属线程的第一问。"""
-    trace = services.new_trace("search", user, clarification=bool(clarification))
+    """as_of 只在复现时传：把「当前日期」钉在原运行的时刻。reask_of 是「改了再问/重新问」所属的原线程。"""
+    is_reask = False
+    if reask_of is not None:
+        async with services.tx(user) as conn:
+            target = await (
+                await conn.execute(
+                    "SELECT COALESCE(parent_search_id, id)::text AS root_id FROM search_logs WHERE id = %s AND deleted_at IS NULL",
+                    (reask_of,),
+                )
+            ).fetchone()
+        if target is None:
+            raise LookupError(f"检索记录不存在：{reask_of}")
+        parent_search_id = target["root_id"]
+        is_reask = True
+
+    trace = services.new_trace("search", user, clarification=bool(clarification), reask=is_reask)
     trace.root.payload["input"] = {"query": query, "clarification": clarification}
     try:
         with trace.activate():
@@ -231,6 +248,7 @@ async def ask(
                 ws=ws,
                 as_of=datetime.fromisoformat(anchor["db"]["as_of"]),
                 parent_search_id=parent_search_id,
+                is_reask=is_reask,
             )
     except Exception as exc:
         error = f"{type(exc).__name__}: {services.models.redact(str(exc))}"[:2000]
@@ -256,10 +274,20 @@ async def _ask(
     ws: Workspace,
     as_of: datetime,
     parent_search_id: str | None = None,
+    is_reask: bool = False,
 ) -> SearchOutcome:
     started = time.monotonic()
     ctx = services.context(user, trace, ws)
     memory = ws.read_text(MEMORY_FILE)
+    async with services.tx(user) as conn:
+        unpurged_deleted = {
+            int(r["msg_seq"])
+            for r in await (
+                await conn.execute("SELECT msg_seq FROM raw_messages WHERE deleted_at IS NOT NULL")
+            ).fetchall()
+        }
+    if unpurged_deleted:
+        memory = retriever.strip_deleted_anchor_lines(memory, unpurged_deleted)
     clues: list[str] = []
     if clarification:
         clues.append(f"用户对上次追问的补充回答：{clarification}")
@@ -344,7 +372,10 @@ async def _ask(
     latency_ms = int((time.monotonic() - started) * 1000)
     async with services.tx(user) as conn:
         existing = await (
-            await conn.execute("SELECT msg_seq FROM raw_messages WHERE msg_seq = ANY(%s)", (draft.verified_msg_seqs,))
+            await conn.execute(
+                "SELECT msg_seq FROM raw_messages WHERE msg_seq = ANY(%s) AND deleted_at IS NULL",
+                (draft.verified_msg_seqs,),
+            )
         ).fetchall()
         verified = sorted(row["msg_seq"] for row in existing)
         row = await (
@@ -353,14 +384,14 @@ async def _ask(
                 INSERT INTO search_logs (
                   user_id, query_text, route_path, outcome, rewritten_queries, memory_clues_used,
                   cache_files_probed, cache_hit_entries, hit_doc_paths, verified_msg_seqs, latency_ms, token_usage,
-                  answer_text, clarify_question, parent_search_id
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s)
+                  answer_text, clarify_question, parent_search_id, is_reask
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
                 RETURNING id::text AS id
                 """,
                 (
                     user.id, query, route_path, outcome, queries[1:], memory_clues, cache_files,
                     json.dumps(cache_hits, ensure_ascii=False), draft.hit_doc_paths, verified, latency_ms,
-                    json.dumps(trace.usage.as_dict()), answer or "", clarify_question, parent_search_id,
+                    json.dumps(trace.usage.as_dict()), answer or "", clarify_question, parent_search_id, is_reask,
                 ),
             )
         ).fetchone()
@@ -378,6 +409,7 @@ async def _ask(
         outcome=outcome,
         route_path=route_path,
         answer=answer,
+        query=query,
         clarify_question=clarify_question,
         verified_msg_seqs=verified,
         hit_doc_paths=draft.hit_doc_paths,
@@ -390,6 +422,7 @@ async def _ask(
         cost_cny=round(trace.cost, 6),
         trace_id=trace.trace_id,
         parent_search_id=parent_search_id,
+        is_reask=is_reask,
     )
     return result
 
@@ -401,7 +434,7 @@ async def clarify(services: Services, user: UserRef, search_id: str, content: st
     async with services.tx(user) as conn:
         row = await (
             await conn.execute(
-                "SELECT query_text, COALESCE(parent_search_id, id)::text AS root_id FROM search_logs WHERE id = %s",
+                "SELECT query_text, COALESCE(parent_search_id, id)::text AS root_id FROM search_logs WHERE id = %s AND deleted_at IS NULL",
                 (search_id,),
             )
         ).fetchone()

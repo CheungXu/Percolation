@@ -116,8 +116,9 @@ async def copy_watermark(owner_url: str, source_id: str, target_id: str, env: di
                         INSERT INTO search_logs (
                           user_id, query_text, route_path, outcome, rewritten_queries, memory_clues_used,
                           cache_files_probed, cache_hit_entries, hit_doc_paths, verified_msg_seqs,
-                          latency_ms, token_usage, created_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s)
+                          latency_ms, token_usage, created_at, answer_text, clarify_question,
+                          parent_search_id, is_reask, deleted_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
                         RETURNING id::text AS id
                         """,
                         (
@@ -125,6 +126,9 @@ async def copy_watermark(owner_url: str, source_id: str, target_id: str, env: di
                             log["memory_clues_used"], log["cache_files_probed"], json.dumps(log["cache_hit_entries"]),
                             log["hit_doc_paths"], log["verified_msg_seqs"], log["latency_ms"],
                             json.dumps(log["token_usage"]) if log["token_usage"] is not None else None, log["created_at"],
+                            log.get("answer_text") or "", log.get("clarify_question") or "",
+                            id_map.get(str(log["parent_search_id"])) if log.get("parent_search_id") else None,
+                            bool(log.get("is_reask")), log.get("deleted_at"),
                         ),
                     )
                 ).fetchone()
@@ -146,15 +150,33 @@ async def copy_watermark(owner_url: str, source_id: str, target_id: str, env: di
                     """
                     INSERT INTO raw_messages (
                       user_id, msg_seq, batch_id, source_kind, reply_to_search_id, content, client_meta,
-                      dream_status, captured_at, dreamed_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+                      dream_status, captured_at, dreamed_at,
+                      edited_at, revision_count, ever_archived, deleted_at, purged_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         target_id, msg["msg_seq"], msg["batch_id"], msg["source_kind"], id_map.get(reply) if reply else None,
                         msg["content"], json.dumps(msg["client_meta"]),
                         "pending" if is_pending else msg["dream_status"], msg["captured_at"],
                         None if is_pending else msg["dreamed_at"],
+                        msg.get("edited_at"), msg.get("revision_count") or 0, bool(msg.get("ever_archived")),
+                        msg.get("deleted_at"), msg.get("purged_at"),
                     ),
+                )
+            revisions = await (
+                await conn.execute(
+                    "SELECT * FROM raw_message_revisions WHERE user_id = %s AND msg_seq <= %s ORDER BY msg_seq, rev_no",
+                    (source_id, max_seq),
+                )
+            ).fetchall()
+            for rev in revisions:
+                await conn.execute(
+                    """
+                    INSERT INTO raw_message_revisions (
+                      user_id, msg_seq, rev_no, prev_content, new_content, revised_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (target_id, rev["msg_seq"], rev["rev_no"], rev["prev_content"], rev["new_content"], rev["revised_at"]),
                 )
             await conn.execute(
                 """

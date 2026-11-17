@@ -18,7 +18,7 @@ from psycopg import AsyncConnection
 
 from agentkit.llm.embedding import to_vector_literal
 from percolation.services import Services, UserRef
-from percolation.wiki import format_facets_summary, merge_facets
+from percolation.wiki import MSG_ANCHOR_RE, format_facets_summary, merge_facets
 
 RRF_K = 60
 PER_ROUTE_LIMIT = 20
@@ -186,9 +186,10 @@ async def _raw_route(conn: AsyncConnection, query: str) -> list[int]:
             f"""
             WITH q AS ({OR_TSQUERY})
             SELECT r.msg_seq FROM raw_messages r, q
-            WHERE (q.query IS NOT NULL AND r.tsv @@ q.query)
+            WHERE r.deleted_at IS NULL
+              AND ((q.query IS NOT NULL AND r.tsv @@ q.query)
                OR word_similarity(%(q)s, r.content) >= %(threshold)s
-               OR r.content ILIKE '%%' || %(q)s || '%%'
+               OR r.content ILIKE '%%' || %(q)s || '%%')
             ORDER BY COALESCE(ts_rank(r.tsv, q.query), 0) + word_similarity(%(q)s, r.content) DESC
             LIMIT %(limit)s
             """,
@@ -213,9 +214,11 @@ async def _matching_date_targets(
         for row in await (
             await conn.execute(
                 """
-                SELECT DISTINCT msg_seq FROM message_events
-                WHERE (%s::date IS NULL OR event_end >= %s::date)
-                  AND (%s::date IS NULL OR event_start <= %s::date)
+                SELECT DISTINCT me.msg_seq FROM message_events me
+                JOIN raw_messages rm ON rm.user_id = me.user_id AND rm.msg_seq = me.msg_seq
+                WHERE rm.deleted_at IS NULL
+                  AND (%s::date IS NULL OR me.event_end >= %s::date)
+                  AND (%s::date IS NULL OR me.event_start <= %s::date)
                 """,
                 (d_from, d_from, d_to, d_to),
             )
@@ -226,7 +229,8 @@ async def _matching_date_targets(
             await conn.execute(
                 """
                 SELECT msg_seq FROM raw_messages
-                WHERE (%s::date IS NULL OR (captured_at AT TIME ZONE 'Asia/Shanghai')::date >= %s::date)
+                WHERE deleted_at IS NULL
+                  AND (%s::date IS NULL OR (captured_at AT TIME ZONE 'Asia/Shanghai')::date >= %s::date)
                   AND (%s::date IS NULL OR (captured_at AT TIME ZONE 'Asia/Shanghai')::date <= %s::date)
                 """,
                 (d_from, d_from, d_to, d_to),
@@ -323,8 +327,10 @@ async def _facet_and_time_routes(
                 """
                 SELECT mf.msg_seq, count(DISTINCT mf.dim || ':' || mf.val)::int AS matched
                 FROM message_facets mf
+                JOIN raw_messages rm ON rm.user_id = mf.user_id AND rm.msg_seq = mf.msg_seq
                 JOIN unnest(%s::text[], %s::text[]) AS f(dim, val)
                   ON mf.dim = f.dim AND mf.val = f.val
+                WHERE rm.deleted_at IS NULL
                 GROUP BY mf.msg_seq
                 """,
                 (dims, vals),
@@ -379,6 +385,14 @@ async def search(
     date_filtered: bool | None = None
 
     async with services.tx(user) as conn:
+        deleted_seqs = {
+            int(r["msg_seq"])
+            for r in await (
+                await conn.execute(
+                    "SELECT msg_seq FROM raw_messages WHERE deleted_at IS NOT NULL"
+                )
+            ).fetchall()
+        }
         event_chunk_ids: set[str] = set()
         captured_chunk_ids: set[str] = set()
         event_raw_seqs: set[int] = set()
@@ -428,7 +442,7 @@ async def search(
         if queries:
             pending_rows = await (
                 await conn.execute(
-                    "SELECT msg_seq FROM raw_messages WHERE dream_status = 'pending' ORDER BY msg_seq DESC LIMIT %s",
+                    "SELECT msg_seq FROM raw_messages WHERE dream_status = 'pending' AND deleted_at IS NULL ORDER BY msg_seq DESC LIMIT %s",
                     (PENDING_LIMIT,),
                 )
             ).fetchall()
@@ -488,11 +502,19 @@ async def search(
                     (wiki_ids,),
                 )
             ).fetchall():
+                raw_chunk_seqs = [int(s) for s in (row["source_msg_seqs"] or [])]
+                live_chunk_seqs = [s for s in raw_chunk_seqs if s not in deleted_seqs] if deleted_seqs else raw_chunk_seqs
+                if raw_chunk_seqs and not live_chunk_seqs:
+                    # 整个切片的所有锚点原话均已被删除（尚未等到夜间整理清文件），立即从召回中剔除
+                    continue
+                content_text = strip_deleted_anchor_lines(row["content"], deleted_seqs) if deleted_seqs else row["content"]
+                if not content_text.strip():
+                    continue
                 key = f"w:{row['id']}"
                 hits[key] = Hit(
                     kind="wiki",
                     key=key,
-                    content=row["content"],
+                    content=content_text,
                     rrf=rrf[key],
                     doc_path=row["doc_path"],
                     title=row["page_title"],
@@ -500,7 +522,7 @@ async def search(
                     facets=dict(row["facets"] or {}),
                     heading=row["section_heading"],
                     certainty=row["certainty"],
-                    source_msg_seqs=list(row["source_msg_seqs"]),
+                    source_msg_seqs=live_chunk_seqs,
                 )
         if raw_seqs:
             mf_map: dict[int, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
@@ -528,7 +550,7 @@ async def search(
 
             for row in await (
                 await conn.execute(
-                    "SELECT msg_seq, content, captured_at, dream_status FROM raw_messages WHERE msg_seq = ANY(%s)",
+                    "SELECT msg_seq, content, captured_at, dream_status FROM raw_messages WHERE msg_seq = ANY(%s) AND deleted_at IS NULL",
                     (raw_seqs,),
                 )
             ).fetchall():
@@ -631,7 +653,7 @@ async def fetch_raw(
     with_batch: bool = True,
     limit: int = 40,
 ) -> list[dict]:
-    """按序号取原话；with_batch 时把同一连发批次的前后消息一起带上，便于还原语境。"""
+    """按序号取未删除的原话；with_batch 时把同一连发批次的前后消息一起带上，便于还原语境。"""
     if not msg_seqs:
         return []
     async with services.tx(user) as conn:
@@ -640,10 +662,12 @@ async def fetch_raw(
                 await conn.execute(
                     """
                     SELECT r.msg_seq, r.batch_id::text AS batch_id, r.source_kind, r.content, r.captured_at,
+                           r.edited_at, r.revision_count, r.ever_archived,
                            r.dream_status, s.query_text AS reply_to_query
                     FROM raw_messages r
                     LEFT JOIN search_logs s ON s.id = r.reply_to_search_id
-                    WHERE r.batch_id IN (SELECT batch_id FROM raw_messages WHERE msg_seq = ANY(%s))
+                    WHERE r.deleted_at IS NULL
+                      AND r.batch_id IN (SELECT batch_id FROM raw_messages WHERE msg_seq = ANY(%s) AND deleted_at IS NULL)
                     ORDER BY r.msg_seq
                     LIMIT %s
                     """,
@@ -655,10 +679,11 @@ async def fetch_raw(
                 await conn.execute(
                     """
                     SELECT r.msg_seq, r.batch_id::text AS batch_id, r.source_kind, r.content, r.captured_at,
+                           r.edited_at, r.revision_count, r.ever_archived,
                            r.dream_status, s.query_text AS reply_to_query
                     FROM raw_messages r
                     LEFT JOIN search_logs s ON s.id = r.reply_to_search_id
-                    WHERE r.msg_seq = ANY(%s)
+                    WHERE r.deleted_at IS NULL AND r.msg_seq = ANY(%s)
                     ORDER BY r.msg_seq
                     LIMIT %s
                     """,
@@ -666,6 +691,27 @@ async def fetch_raw(
                 )
             ).fetchall()
     return [dict(row) for row in rows]
+
+
+def strip_deleted_anchor_lines(text: str, deleted_seqs: set[int]) -> str:
+    """剔除全部锚点均已被用户删除的行；混合锚点行只摘除已删序号标记。"""
+    if not text or not deleted_seqs:
+        return text
+    out_lines: list[str] = []
+    for line in text.splitlines():
+        found = [int(v) for v in MSG_ANCHOR_RE.findall(line)]
+        if not found:
+            out_lines.append(line)
+            continue
+        live = [s for s in found if s not in deleted_seqs]
+        if not live:
+            continue
+        cleaned = line
+        for s in found:
+            if s in deleted_seqs:
+                cleaned = cleaned.replace(f"[#msg_{s}]", "").replace(f"#msg_{s}", "")
+        out_lines.append(cleaned.rstrip())
+    return "\n".join(out_lines)
 
 
 async def traced_search(
@@ -745,6 +791,9 @@ def render_raw(rows: list[dict]) -> str:
         when = f"{local_dt:%Y-%m-%d} {WEEKDAYS_ZH[local_dt.weekday()]} {local_dt:%H:%M}"
         extra = ""
         if row["source_kind"] == "clarification":
-            extra = f" · 澄清，回答的问题：{row.get('reply_to_query') or '未知'}"
+            extra += f" · 澄清，回答的问题：{row.get('reply_to_query') or '未知'}"
+        if row.get("edited_at") is not None or (row.get("revision_count") or 0) > 0:
+            edit_dt = row["edited_at"].astimezone(LOCAL_TZ) if row.get("edited_at") else local_dt
+            extra += f" · 已于 {edit_dt:%m-%d %H:%M} 修订（以本条最新内容为准）"
         lines.append(f"#{row['msg_seq']} [{when} · 批次 {row['batch_id'][:8]} · {row['dream_status']}{extra}] {row['content']}")
     return "\n".join(lines)

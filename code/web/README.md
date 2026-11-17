@@ -31,18 +31,22 @@
 | 发问 | 先插入问题和「思考中」（文案按耗时切换：翻看你的记录 → 核对原话 → 组织回答）；回答到后闪烁依据原话 | `POST v1/search` |
 | 补一句（追问） | 回答为 `clarify_asked` 时在线程里出现输入框；提交后补充写进记录流，线程追加重查结果 | `POST v1/clarify` |
 | 依据标签 | 定位并高亮原话；原话不在已加载范围时自动向前翻页 | `GET v1/notes?before_seq=` |
-| 找记录 | 入口：桌面点记录标题栏的条数或按 `/`（焦点不在输入框，或记录框为空）；手机上记录框空着时发送键是放大镜，已在记录页时再点顶栏「记录」也能打开。输入法组字期间不发请求。结果是「折叠的时间线」：命中按时间排开，中间没命中的收成「N 条」折痕，点开取两侧各 3 条上下文；`↑↓` 选、`Enter` 或点击定位到原处（收起搜索后高亮）；搜不到时一键转去询问。重新打开带回上次的词 | `GET v1/notes/search?q=`、`GET v1/notes/between` |
+| 找记录 | 入口：桌面点记录标题栏的条数或按 `/`（焦点不在输入框，或记录框为空）；手机上记录框空着时发送键是放大镜，已在记录页时再点顶栏「记录」也能打开。输入法组字期间不发请求。结果是「折叠的时间线」：命中按时间排开，中间没命中的收成「N 条」折痕，点开取两侧各 3 条上下文；`↑↓` 选、`Enter` 或点击定位到原处（收起搜索后高亮）；搜不到时一键转去询问。重新打开带回上次的词。有命中时标题栏出现「选择」，可勾选或「全选命中」后一起删 | `GET v1/notes/search?q=`、`GET v1/notes/between` |
+| 改一句 | 桌面悬停后时间让开，露出「改 / 删」；键盘按 `E`（搜索框里用 Alt 或 ⌘/Ctrl + E，避免把字母 e 吃掉）。原地变成输入框，圆点变空心，`Enter` 保存，`Shift+Enter` 换行，`Esc` 取消。已融入近况、或被回答引用时才出现一行提示。保存后原句留下可点的「改」，划掉上一版 | `PATCH v1/notes/{seq}`、`GET v1/notes/{seq}/revisions` |
+| 删一句 | 不确认。原位置收成虚线「已删除 · 撤销」，6 秒内可撤销；窗口结束才从列表拿掉。检索里的批量删除走同一条撤销。夜里整理才会从记忆页摘掉并抹掉原文 | `POST v1/notes/delete`、`POST v1/notes/restore` |
+| 手机长按 | 滑动留给记录 / 询问切换。长按记录或问题约 480ms，浮出「编辑 · 复制 · 删除」或「改了再问 · 删除」，其余变暗。手指移动超过约 10px 就取消 | — |
+| 改了再问 | 悬停问题出现「改了再问」和「删除」。改了再问在原问题处编辑，`Enter` 提交后新回答接在同一线程下，更早的回答收进「之前的回答」。依据被改过显示「依据已更新 · 重新问」，依据被删显示「依据已删除」 | `POST v1/search`（`reask_of`）、`POST v1/threads/{id}/delete`、`POST v1/threads/{id}/restore` |
 | 向上滚动 | 记录流 / 问答流滚到顶部附近时加载更早的 | `v1/notes?before_seq=`、`v1/threads?before_id=` |
 | 我的近况 | 浮层（手机为底部抽屉），30 秒内复用缓存；空时提示「每晚凝练」 | `GET v1/context` |
 | 退出登录 | 先清后端身份缓存，再退出星页登录 | `POST v1/session/forget`、`POST /api/auth/logout` |
 
-线程数据结构与接口一致：`{id, query, at, steps: [{search_id, outcome, answer, clarify_question, seqs, cues, reply}]}`，`steps` 依次是第一问和每次澄清后的重查，`reply` 是用户对这一步追问的补充。前端另加 `key`（本地生成、提交前后不变）、`pending`、`error`。
+线程数据结构与接口一致：`{id, query, at, steps: [{search_id, query, reask, outcome, answer, clarify_question, seqs, deleted_seqs, updated_seqs, cues, reply}]}`。`query` 是这条线程最新一次「改了再问」的问法，每一步仍保留自己的 `query`。`steps` 依次是第一问、澄清后的重查和改了再问。前端另加 `key`（本地生成、提交前后不变）、`pending`、`error`、`tomb`、`showPast`。
 
 ## 渲染约定
 
 - **外壳只挂载一次**（`mount()`），之后按区域局部重绘：`paintNotes()`、`paintThreads()`、`paintMenu()`。异步结果回来时不会重建两个主输入框，避免打断正在组字的输入法。
 - 重绘问答流时会保存并恢复追问输入框的内容（`ui.clarifyDrafts`）和光标位置。
-- 「贴底」判断：重绘前离底部不到 40px 就重绘后滚到底；加载更早内容时保持与底部的距离（`keepOffset`）。
+- 「贴底」判断：重绘前离底部不到 40px 就重绘后滚到底；加载更早内容时保持与底部的距离（`keepOffset`）。编辑、删除、长按这些不该把列表拽回底部的重绘传 `keepScroll`，原样恢复 `scrollTop`。正在编辑时重绘会把光标放回原位。
 - 工作区切换不重绘，只切类名；移动端由横向滚动进度 `--p` 驱动全部过渡。
 - 找记录打开且有词时，`paintNotes()` 画搜索结果（`ui.find.items`）而不是记录流；记一句、点依据标签会先收起搜索。新结果回来前保留旧结果，不闪。展开折痕时用 `anchor` 让相邻命中停在原位。
 - 两个主输入框的草稿存 `localStorage`（`pc_draft_cap` / `pc_draft_ask`），退出登录时清掉。
@@ -57,6 +61,8 @@ node ../script/qa_web.mjs --base http://127.0.0.1:8711/ --slug <e2e- 开头的�
 
 找记录单独走查：`script/seed_web_find.py --slug e2e-webfind-1` 建一个带近两周 38 条原话的临时租户，`node script/qa_web_find.mjs --slug e2e-webfind-1` 跑桌面 + 手机（390 / 360 宽）共 19 项断言，截图 `images/product-web/find-*.png`，完了 `seed_web_find.py --slug ... --drop` 清理。
 
+编辑和删除走查：`node script/qa_web_edit.mjs --slug e2e-webedit-1`（同样要先有这个 `e2e-` 租户，并起一个 `AUTH_MODE=header` 的本机服务）。它不调用检索模型，覆盖原地编辑、上一版划线、删除撤销、检索里批量删除、问答的改了再问，以及手机长按。截图 `images/product-web/edit-*.png`。
+
 `qa_web.mjs` 的几种模式（完整流程、`--login-only`、`--showcase`、`--smoke`）见脚本开头注释，截图输出到 `images/product-web/`。完整流程会真实调用检索模型。临时租户的建立与清理见 `code/percolation/README.md`。
 
 ## 已知限制
@@ -64,4 +70,4 @@ node ../script/qa_web.mjs --base http://127.0.0.1:8711/ --slug <e2e- 开头的�
 - 前端没有埋点；AB 对比需要先补（建议指标见 `alternatives/product-ui/README.md`）。
 - 询问是一次性返回，没有流式输出；慢的时候靠思考文案过渡（Nginx 读超时 180 秒）。
 - 找记录：字面命中最多列最近 200 条，更早的折进「更早 N 条」，展开后不再标为命中；每次查询全表扫原话，记录上万条后需要加索引。定位比已加载早 20 页以上的记录会提示失败。
-- 还没有删除 / 编辑记录的入口：原话表只追加，要配合修订表和夜间整理一起做，方案见 `doc/20261117/history-search-edit-delete-design.md`。
+- 删除后的 6 秒撤销只活在当前页面：刷新或重新登录会按服务端已软删除的结果展示，撤销入口不再出现。原文要等夜间整理抹掉。

@@ -150,9 +150,9 @@ async def db_watermark(services: Services, user: UserRef, *, as_of: datetime | N
                        u.last_defrag_at, u.dirty_since, u.created_at,
                        (SELECT max(msg_seq) FROM raw_messages) AS max_msg_seq,
                        (SELECT COALESCE(array_agg(msg_seq ORDER BY msg_seq), '{}')
-                          FROM raw_messages WHERE dream_status = 'pending') AS pending_msg_seqs,
-                       (SELECT count(*) FROM search_logs) AS search_logs_count,
-                       (SELECT max(created_at) FROM search_logs) AS search_logs_max_at
+                          FROM raw_messages WHERE dream_status = 'pending' AND deleted_at IS NULL) AS pending_msg_seqs,
+                       (SELECT count(*) FROM search_logs WHERE deleted_at IS NULL) AS search_logs_count,
+                       (SELECT max(created_at) FROM search_logs WHERE deleted_at IS NULL) AS search_logs_max_at
                 FROM users u WHERE u.id = %s
                 """,
                 (as_of, user.id),

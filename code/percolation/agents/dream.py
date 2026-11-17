@@ -27,6 +27,7 @@ from agentkit.tenancy import try_advisory_lock
 from agentkit.workspace import Workspace
 from percolation import env_anchor, retriever
 from percolation.agents import SKILLS_DIR, load_prompt
+from percolation.capture import purge_in_tx
 from percolation.indexer import SyncPlan, SyncReport, apply_sync, load_pages, plan_sync
 from percolation.memory_fs import (
     CACHE_DIR,
@@ -48,9 +49,16 @@ from percolation.memory_fs import (
 )
 from percolation.services import Services, UserRef
 from percolation.tools import FETCH_RAW, HYBRID_SEARCH, memory_write_tools
-from percolation.wiki import MSG_ANCHOR_RE, effective_facets_catalog, format_facets_summary, format_facets_taxonomy
+from percolation.wiki import (
+    MSG_ANCHOR_RE,
+    effective_facets_catalog,
+    format_facets_summary,
+    format_facets_taxonomy,
+    parse_page,
+)
 
 ARCHIVE_BATCH_MESSAGES = 40
+PURGE_GRACE_SECONDS = 60
 PROMOTION_WINDOW_DAYS = 14
 PROMOTION_MIN_HITS = 2
 DEFRAG_INTERVAL_DAYS = 7
@@ -117,12 +125,17 @@ class TieringReport(BaseModel):
 
 
 @cache
-def archive_spec(memory_limit: int) -> AgentSpec:
+def archive_spec(memory_limit: int, *, include_hot: bool = False, allow_delete: bool = False) -> AgentSpec:
+    prefixes = ((MEMORY_FILE,) if include_hot else ()) + (f"{WIKI_DIR}/", f"{CACHE_DIR}/")
     return AgentSpec(
         name="dream_archive",
         model_slot="dream_model",
         system_prompt=load_prompt("dream_archive"),
-        tools=(HYBRID_SEARCH, FETCH_RAW, *memory_write_tools(memory_limit, write_prefixes=(f"{WIKI_DIR}/", f"{CACHE_DIR}/"))),
+        tools=(
+            HYBRID_SEARCH,
+            FETCH_RAW,
+            *memory_write_tools(memory_limit, write_prefixes=prefixes, allow_delete=allow_delete),
+        ),
         output_model=ArchiveReport,
         max_turns=30,
         skills_dir=SKILLS_DIR,
@@ -151,6 +164,7 @@ class DreamOutcome:
     run_id: str | None = None
     archived: list[int] = field(default_factory=list)
     skipped: list[int] = field(default_factory=list)
+    purged: list[int] = field(default_factory=list)
     still_pending: list[int] = field(default_factory=list)
     files_changed: list[str] = field(default_factory=list)
     promotions: list[dict] = field(default_factory=list)
@@ -190,6 +204,68 @@ def _anchored_seqs(ws) -> set[int]:
         if path.is_file():
             seqs.update(int(value) for value in MSG_ANCHOR_RE.findall(path.read_text(encoding="utf-8", errors="replace")))
     return seqs
+
+
+def _anchor_locations(ws, target_seqs: set[int]) -> dict[int, list[tuple[str, str]]]:
+    """扫描工作区中引用了指定 msg_seq 的文件与具体行，供整理同步修订和清理删除使用。"""
+    if not target_seqs:
+        return {}
+    out: dict[int, list[tuple[str, str]]] = {}
+    for path in [*ws.files(WIKI_DIR, "**/*.md"), *ws.files(CACHE_DIR, "**/*.md"), ws.resolve(MEMORY_FILE)]:
+        if not path.is_file():
+            continue
+        rel = ws.rel(path)
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            found = {int(v) for v in MSG_ANCHOR_RE.findall(line)} & target_seqs
+            for seq in found:
+                out.setdefault(seq, []).append((rel, line.strip()))
+    return out
+
+
+def _scrub_deleted_anchors(ws, deleted_seqs: set[int]) -> None:
+    """确定性兜底：移除仍残留已删除原话锚点的条目行；若主题页/缓存文件被删空则一并删除。"""
+    if not deleted_seqs:
+        return
+    for path in [*ws.files(WIKI_DIR, "**/*.md"), *ws.files(CACHE_DIR, "**/*.md"), ws.resolve(MEMORY_FILE)]:
+        if not path.is_file():
+            continue
+        rel = ws.rel(path)
+        orig = path.read_text(encoding="utf-8", errors="replace")
+        cleaned = retriever.strip_deleted_anchor_lines(orig, deleted_seqs)
+        if cleaned == orig:
+            continue
+        if rel.startswith(f"{WIKI_DIR}/"):
+            page = parse_page(rel, cleaned, None)
+            if not page.chunks:
+                path.unlink(missing_ok=True)
+                continue
+        elif rel.startswith(f"{CACHE_DIR}/") and path.name != "facets.md":
+            has_bullet = any(line.lstrip().startswith(("-", "*")) for line in cleaned.splitlines())
+            if not has_bullet:
+                path.unlink(missing_ok=True)
+                continue
+        ws.write_atomic(rel, cleaned if cleaned.endswith("\n") else cleaned + "\n")
+
+
+def _format_mutation_section(
+    revised_rows: list[dict],
+    prev_by_seq: dict[int, str],
+    anchored_deletes: list[int],
+    anchor_locs: dict[int, list[tuple[str, str]]],
+) -> str:
+    lines: list[str] = []
+    for row in revised_rows:
+        seq = int(row["msg_seq"])
+        prev = prev_by_seq.get(seq, "")
+        locs = anchor_locs.get(seq, [])
+        loc_desc = "；".join(f"{rel}: {txt}" for rel, txt in locs[:4]) or "（尚未写入记忆文件，按新内容归档即可）"
+        diff = f"原内容：「{prev}」 → 最新内容：「{row['content']}」" if prev else f"最新内容：「{row['content']}」"
+        lines.append(f"- [已修订 #msg_{seq}] {diff}\n  当前记忆文件位置：{loc_desc}")
+    for seq in anchored_deletes:
+        locs = anchor_locs.get(seq, [])
+        loc_desc = "；".join(f"{rel}: {txt}" for rel, txt in locs[:6])
+        lines.append(f"- [已删除 #msg_{seq}] 用户已删除此条原话，请从以下位置移除对应事实（或移除该锚点）：\n  {loc_desc}")
+    return "\n".join(lines)
 
 
 def _batches(rows: list[dict], limit: int) -> list[list[dict]]:
@@ -253,7 +329,8 @@ async def _cache_hit_stats(services: Services, user: UserRef, as_of: datetime) -
                        hit->>'entry_key' AS entry_key,
                        max(hit->>'clue') AS clue, count(*) AS hits, max(s.created_at) AS last_hit
                 FROM search_logs s, jsonb_array_elements(s.cache_hit_entries) AS hit
-                WHERE s.route_path = 'cache_fallback' AND s.outcome = 'answered'
+                WHERE s.deleted_at IS NULL
+                  AND s.route_path = 'cache_fallback' AND s.outcome = 'answered'
                   AND s.created_at >= %(as_of)s::timestamptz - %(window)s::interval
                   AND s.created_at <= %(as_of)s::timestamptz
                 GROUP BY 2 ORDER BY hits DESC, last_hit DESC
@@ -271,7 +348,8 @@ async def _memory_clue_usage(services: Services, user: UserRef, as_of: datetime)
                 """
                 SELECT clue, count(*) AS uses, max(created_at) AS last_used
                 FROM search_logs, unnest(memory_clues_used) AS clue
-                WHERE created_at >= %(as_of)s::timestamptz - interval '30 days'
+                WHERE deleted_at IS NULL
+                  AND created_at >= %(as_of)s::timestamptz - interval '30 days'
                   AND created_at <= %(as_of)s::timestamptz
                 GROUP BY 1 ORDER BY uses DESC LIMIT 100
                 """,
@@ -435,6 +513,7 @@ async def _dream(
     env_anchor.attach(trace, anchor)
     as_of = datetime.fromisoformat(anchor["db"]["as_of"])
     max_msg_seq = anchor["db"]["max_msg_seq"]
+    purge_cutoff = as_of - timedelta(seconds=PURGE_GRACE_SECONDS)
 
     async with services.tx(user) as conn:
         state = await (await conn.execute("SELECT * FROM users WHERE id = %s", (user.id,))).fetchone()
@@ -444,15 +523,62 @@ async def _dream(
                 await conn.execute(
                     """
                     SELECT r.msg_seq, r.batch_id::text AS batch_id, r.source_kind, r.content, r.captured_at,
+                           r.edited_at, r.revision_count, r.ever_archived, r.dreamed_at,
                            r.dream_status, s.query_text AS reply_to_query
                     FROM raw_messages r LEFT JOIN search_logs s ON s.id = r.reply_to_search_id
-                    WHERE r.dream_status = 'pending' AND r.msg_seq <= %s ORDER BY r.msg_seq LIMIT 400
+                    WHERE r.dream_status = 'pending' AND r.deleted_at IS NULL AND r.msg_seq <= %s
+                    ORDER BY r.msg_seq LIMIT 400
                     """,
                     (max_msg_seq,),
                 )
             ).fetchall()
         ]
+        to_purge_rows = [
+            dict(row)
+            for row in await (
+                await conn.execute(
+                    """
+                    SELECT msg_seq, ever_archived, deleted_at
+                    FROM raw_messages
+                    WHERE deleted_at IS NOT NULL AND purged_at IS NULL
+                      AND deleted_at <= %s AND msg_seq <= %s
+                    ORDER BY msg_seq LIMIT 400
+                    """,
+                    (purge_cutoff, max_msg_seq),
+                )
+            ).fetchall()
+        ]
+        revised_rows = [r for r in pending if r.get("ever_archived") and (r.get("revision_count") or 0) > 0]
+        prev_by_seq: dict[int, str] = {}
+        if revised_rows:
+            rev_seqs = [int(r["msg_seq"]) for r in revised_rows]
+            dreamed_map = {int(r["msg_seq"]): r.get("dreamed_at") for r in revised_rows}
+            for rev in await (
+                await conn.execute(
+                    """
+                    SELECT msg_seq, rev_no, prev_content, revised_at
+                    FROM raw_message_revisions
+                    WHERE msg_seq = ANY(%s)
+                    ORDER BY msg_seq, rev_no ASC
+                    """,
+                    (rev_seqs,),
+                )
+            ).fetchall():
+                s = int(rev["msg_seq"])
+                if s in prev_by_seq:
+                    continue
+                d_at = dreamed_map.get(s)
+                if d_at is None or rev["revised_at"] >= d_at:
+                    prev_by_seq[s] = rev["prev_content"]
         dangling = (await (await conn.execute("SELECT count(*) AS n FROM wiki_links WHERE to_doc_path IS NULL")).fetchone())["n"]
+
+    to_purge_seqs = [int(r["msg_seq"]) for r in to_purge_rows]
+    target_anchor_seqs = {int(r["msg_seq"]) for r in revised_rows} | set(to_purge_seqs)
+    anchor_locs = _anchor_locations(main, target_anchor_seqs)
+    anchored_deletes = [seq for seq in to_purge_seqs if seq in anchor_locs]
+    touch_hot = any(rel == MEMORY_FILE for seq in target_anchor_seqs for rel, _ in anchor_locs.get(seq, []))
+    mutation_text = _format_mutation_section(revised_rows, prev_by_seq, anchored_deletes, anchor_locs)
+
     memory_init = main.read_text(MEMORY_FILE)
     memory_lines = line_count(memory_init)
     mode, reasons = decide_mode(state, memory_lines, soft_limit, dangling, requested_mode, as_of=as_of)
@@ -475,12 +601,19 @@ async def _dream(
         dangling=dangling,
     )
 
-    if not pending and not needs_tiering:
+    if not pending and not needs_tiering and not anchored_deletes:
         async with services.tx(user) as conn:
+            purged_fast = await purge_in_tx(conn, to_purge_seqs) if to_purge_seqs else []
             await _finalize(conn, user, None, mode, [], [], memory_lines, ArchiveReport(), TieringReport(), [], trace, defrag=False)
-        return DreamOutcome(user_id=user.id, status="noop", mode=mode)
+        return DreamOutcome(
+            user_id=user.id,
+            status="succeeded" if purged_fast else "noop",
+            mode=mode,
+            purged=purged_fast,
+        )
 
     seqs = [row["msg_seq"] for row in pending]
+    all_work_seqs = seqs + to_purge_seqs
     async with services.tx(user) as conn:
         run = await (
             await conn.execute(
@@ -488,11 +621,19 @@ async def _dream(
                 INSERT INTO dream_runs (user_id, run_mode, status, msg_seq_from, msg_seq_to)
                 VALUES (%s, %s, 'running', %s, %s) RETURNING id::text AS id
                 """,
-                (user.id, mode, min(seqs) if seqs else None, max(seqs) if seqs else None),
+                (user.id, mode, min(all_work_seqs) if all_work_seqs else None, max(all_work_seqs) if all_work_seqs else None),
             )
         ).fetchone()
     run_id = run["id"]
-    trace.event("dream_start", run_id=run_id, mode=mode, pending=len(pending), candidates=len(candidates))
+    trace.event(
+        "dream_start",
+        run_id=run_id,
+        mode=mode,
+        pending=len(pending),
+        anchored_deletes=len(anchored_deletes),
+        to_purge=len(to_purge_seqs),
+        candidates=len(candidates),
+    )
 
     branch = staging_branch(run_id)
     staging_path = settings.nas_root / "staging" / user.id / run_id
@@ -506,21 +647,28 @@ async def _dream(
         memory = memory_init
         catalog = await _catalog_with_existing_facets(services, user, ws)
         taxonomy_text = format_facets_taxonomy(catalog)
-        for group in _batches(pending, ARCHIVE_BATCH_MESSAGES):
-            prompt = "\n\n".join(
-                [
-                    _section("当前日期", retriever.format_local_today(as_of)),
-                    _section("受控维度词表", taxonomy_text),
-                    _section("热区记忆 MEMORY.md", memory),
-                    _section("现有主题页", _wiki_index_text(ws)),
-                    _section("候选缓存区文件", "\n".join(ws.rel(p) for p in ws.files(CACHE_DIR, "**/*.md"))),
-                    _section("待整理原话（按连发批次排列，含录入星期）", retriever.render_raw(group)),
-                ]
-            )
-            report: ArchiveReport = (await run_agent(archive_spec(memory_limit), prompt, ctx)).output
+        spec = archive_spec(memory_limit, include_hot=touch_hot, allow_delete=bool(anchored_deletes))
+        batches = _batches(pending, ARCHIVE_BATCH_MESSAGES)
+        if not batches and anchored_deletes:
+            batches = [[]]
+        for batch_idx, group in enumerate(batches):
+            prompt_parts = [
+                _section("当前日期", retriever.format_local_today(as_of)),
+                _section("受控维度词表", taxonomy_text),
+                _section("热区记忆 MEMORY.md", ws.read_text(MEMORY_FILE) if batch_idx else memory),
+                _section("现有主题页", _wiki_index_text(ws)),
+                _section("候选缓存区文件", "\n".join(ws.rel(p) for p in ws.files(CACHE_DIR, "**/*.md"))),
+                _section("待整理原话（按连发批次排列，含录入星期）", retriever.render_raw(group)),
+            ]
+            if batch_idx == 0 and mutation_text:
+                prompt_parts.append(_section("待同步的修订与删除", mutation_text))
+            report: ArchiveReport = (await run_agent(spec, "\n\n".join(prompt_parts), ctx)).output
             archive.archived_msg_seqs += report.archived_msg_seqs
             archive.skipped_msg_seqs += report.skipped_msg_seqs
             archive.notes = "\n".join(filter(None, [archive.notes, report.notes]))
+
+        if to_purge_seqs:
+            _scrub_deleted_anchors(ws, set(to_purge_seqs))
 
         plan = await _traced_plan(services, user, ws, trace, vector_cache, "plan_sync")
         embedded = plan.embedded
@@ -583,6 +731,7 @@ async def _dream(
             async with services.tx(user) as conn:
                 index_report = await apply_sync(conn, user, plan)
                 index_report.embedded = embedded
+                purged = await purge_in_tx(conn, to_purge_seqs) if to_purge_seqs else []
                 await _finalize(
                     conn, user, run_id, mode, archived, skipped, memory_lines, archive, tiering, files, trace,
                     defrag=mode == "defrag", workspace_head=head,
@@ -598,11 +747,11 @@ async def _dream(
             except Exception as exc:  # noqa: BLE001
                 ff_error = f"主工作区快进失败，已保留分支 {branch}，下次整理或检索补齐：{services.models.redact(str(exc))}"[:500]
                 trace.event("publish_ff_failed", error=ff_error, branch=branch)
-            span.set(fast_forward_failed=ff_error is not None, **index_report.as_dict())
+            span.set(fast_forward_failed=ff_error is not None, purged=purged, **index_report.as_dict())
         gc_auto(main)
         outcome = DreamOutcome(
             user_id=user.id, status="succeeded", mode=mode, run_id=run_id, archived=archived, skipped=skipped,
-            still_pending=still_pending, files_changed=files,
+            purged=purged, still_pending=still_pending, files_changed=files,
             promotions=[m.model_dump() for m in tiering.promotions], demotions=[m.model_dump() for m in tiering.demotions],
             index=index_report.as_dict(), commit=commit, error=ff_error, usage=trace.usage.as_dict(),
         )
@@ -645,25 +794,38 @@ async def _finalize(
     await conn.execute("SELECT 1 FROM users WHERE id = %s FOR UPDATE", (user.id,))
     if archived:
         await conn.execute(
-            "UPDATE raw_messages SET dream_status = 'archived', dreamed_at = now() WHERE msg_seq = ANY(%s) AND dream_status = 'pending'",
+            """
+            UPDATE raw_messages
+            SET dream_status = 'archived', ever_archived = true, dreamed_at = now()
+            WHERE msg_seq = ANY(%s) AND dream_status = 'pending' AND deleted_at IS NULL
+            """,
             (archived,),
         )
     if skipped:
         await conn.execute(
-            "UPDATE raw_messages SET dream_status = 'skipped', dreamed_at = now() WHERE msg_seq = ANY(%s) AND dream_status = 'pending'",
+            """
+            UPDATE raw_messages
+            SET dream_status = 'skipped', dreamed_at = now()
+            WHERE msg_seq = ANY(%s) AND dream_status = 'pending' AND deleted_at IS NULL
+            """,
             (skipped,),
         )
     await conn.execute(
         """
         UPDATE users SET
           pending_msg_count = sub.n,
-          dirty_since = CASE WHEN sub.n > 0 THEN COALESCE(dirty_since, now()) ELSE NULL END,
+          dirty_since = CASE WHEN sub.n > 0 OR sub.u > 0 THEN COALESCE(dirty_since, now()) ELSE NULL END,
           pending_cache_hits = 0,
           memory_line_count = %s,
           last_dream_at = now(),
           last_defrag_at = CASE WHEN %s THEN now() ELSE last_defrag_at END,
           workspace_head = COALESCE(%s, workspace_head)
-        FROM (SELECT count(*)::int AS n FROM raw_messages WHERE dream_status = 'pending') sub
+        FROM (
+          SELECT
+            count(*) FILTER (WHERE dream_status = 'pending' AND deleted_at IS NULL)::int AS n,
+            count(*) FILTER (WHERE deleted_at IS NOT NULL AND purged_at IS NULL)::int AS u
+          FROM raw_messages
+        ) sub
         WHERE users.id = %s
         """,
         (memory_lines, defrag, workspace_head, user.id),

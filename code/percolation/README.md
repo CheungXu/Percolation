@@ -58,13 +58,13 @@
 1. `list_dirty_users()` 取脏租户，`try_advisory_lock("percolation:dream:<uid>")` 防重入，拿不到锁返回 `locked`。`reindex` 用同一把锁。
 2. `prepare_workspace`：清理超过 90 秒的残留 `index.lock`（兼容主仓库与 worktree）；`users.workspace_head` 领先主工作区时补快进（上次发布在快进前中断），并删掉已并入主线的 `dream/*` 残留分支；主工作区领先 `workspace_head`（人工提交过）或有未提交改动，就先计算同步计划再提交并同步索引登记新的 `workspace_head`（若发布失败自动 mixed reset 撤回提交，不留孤立版本）。两者分叉、登记的提交已不存在、或补快进被冲突的未提交文件挡住时报错（冲突文件会原样保留并给出 `git stash -u` 恢复指引），需要人工处理。之后主工作区干净、HEAD 等于 `workspace_head`、派生表与 HEAD 一致。
 3. 记执行环境锚点（见下文），时钟 `as_of` 取库时钟（复现时注入原值）。
-4. 节奏 `decide_mode(…, as_of)`：`MEMORY.md` 超过 90% 上限、悬空链接 ≥ 5、或距上次重整（或建号）≥ 7 天时为 `defrag`，否则 `incremental`；模式与理由写进锚点的 `decision`。没有待整理原话、也没有升降级需求时直接 `noop`。待整理原话只取锚点水位 `max_msg_seq` 以内的。
+4. 节奏 `decide_mode(…, as_of)`：`MEMORY.md` 超过 90% 上限、悬空链接 ≥ 5、或距上次重整（或建号）≥ 7 天时为 `defrag`，否则 `incremental`；模式与理由写进锚点的 `decision`。没有待整理原话、没有升降级需求、也没有挂着记忆页锚点的删除时，若还有已过撤销窗口的未抹除删除，就把这些删除抹掉并记 `succeeded`，否则 `noop`。待整理原话只取锚点水位 `max_msg_seq` 以内、且未删除的。
 5. 建暂存 worktree：`/mnt/percolation/staging/<uid>/<run_id>`（0700），分支 `dream/<run_id>`。之后所有写入都只发生在这里，检索只读主工作区与已发布索引。
-6. `dream_archive` 按连发批次（每组 ≤ 40 条，不拆批次）归档，“当前日期”用 `as_of`。
+6. `dream_archive` 按连发批次（每组 ≤ 40 条，不拆批次）归档，“当前日期”用 `as_of`。曾经整理过、后来又改过的原话，以及仍被记忆页引用的删除，会作为「待同步的修订与删除」交给这一步。模型写完后，`_scrub_deleted_anchors` 再按 `#msg_N` 把已删原话从暂存区摘掉：主题页因此没有条目就删文件，缓存文件摘空则删（`facets.md` 除外）。
 7. `plan_sync` 只算计划（新切片向量、悬空链接），不写库。
 8. 有晋升候选（`as_of` 前 14 天内命中 ≥ 2 次）、热区超水位或 `defrag` 时跑升降级节点；`defrag` 的维度分布直接从暂存区文件统计，悬空链接来自计划；`defrag` 后再算一次计划（向量缓存复用）。
 9. 对账：模型报告的序号与文件里实际出现的 `#msg_N` 取并集作为已归档，报告跳过的标 `skipped`，其余保持 `pending`。
-10. 发布：暂存分支提交 → **一个事务**里 `apply_sync` 刷新六张派生表 + 推进原话状态 + 重算计数 + 写 `dream_runs` + 登记 `users.workspace_head` → 主工作区 `merge --ff-only` → `gc --auto`。
+10. 发布：暂存分支提交 → **一个事务**里 `apply_sync` 刷新六张派生表 + 对已过 60 秒撤销窗口、且序号不超过本次水位的删除调用 `purge_messages`（正文清空、修订历史删掉，只留序号占位）+ 推进未删除原话的状态 + 重算计数 + 写 `dream_runs` + 登记 `users.workspace_head` → 主工作区 `merge --ff-only` → `gc --auto`。列表、检索、召回和图谱在软删除当下就不再返回这些原话。
 11. 发布事务之前任一步失败：删暂存区和分支，主工作区与索引从没被碰过，`dream_runs` 记 `failed`，原话保持 `pending`。事务一提交就把分支标为保留（主工作区追上前它是新提交唯一的引用），快进成功才删；快进失败时结果仍是 `succeeded`，但 `error` 写明“已保留分支”，下次第 2 步或下一次检索补快进。检索开头发现 `workspace_mismatch` 时调用 `dream.repair_fast_forward`：不阻塞地尝试拿整理锁，拿到就只做快进（不做索引同步），拿不到或失败都不影响检索，记 `workspace_repaired` / `workspace_repair_failed` 事件。
 
 ## 执行环境锚点与复现
@@ -83,7 +83,7 @@
 
 1. 没有锚点的旧轨迹、回放轨迹本身、`level=summary` 丢了入参的轨迹直接拒绝。
 2. 每次重跑建一个全新 `replay-<trace8>-<ts>-rN` 租户（建之前先登记，中途失败也会被清理）；原工作区 `git clone` 后 reset 到锚点 `git_head`。
-3. 建表账号单事务复制三张事实表：`as_of` 之前的检索日志（id 重映射）、`max_msg_seq` 以内的原话（保留序号/批次/录入时间/来源，锚点时 pending 的恢复为 pending，`reply_to_search_id` 按映射改写）、用户状态计数与 `next_msg_seq`。
+3. 建表账号单事务复制三张事实表：`as_of` 之前的检索日志（id 重映射，含 `is_reask` 与 `deleted_at`）、`max_msg_seq` 以内的原话（保留序号/批次/录入时间/来源和修订、删除、抹除状态，锚点时 pending 的恢复为 pending，`reply_to_search_id` 按映射改写）及其 `raw_message_revisions`、用户状态计数与 `next_msg_seq`。
 4. 派生表不复制，按文件 `plan_sync`/`apply_sync` 重建，向量按 `content_hash` 复用原租户的。
 5. 以原入参重跑（检索：原问题与澄清；整理：原入参 `requested_mode`，自动整理保持为空以便重新执行 `decide_mode`），注入 `as_of`；新轨迹带 `replay_of`/`replay_run`，`RunContext.replay=True`，带 `side_effect` 标签的工具被循环拦截。
 6. 报告：检索比 outcome/路由/维度与日期条件/核验序号/命中页/回答/成本/耗时/指纹；整理比状态/模式/判定理由（`decision_reasons`）/归档与跳过集合/改动文件/晋升/索引计数，并逐文件比对原提交与重跑提交的内容；另列水位核对和代码/依赖/配置差异。锚点显示原运行时工作区有未提交改动（`git_clean=false`/`null`）或工作区与已发布索引不一致时，报告开头给出 `warnings`；原话引用了水位外检索日志的条数记在 `setup.unmapped_replies`。代码摘要不同时给出用原提交开 worktree 复现的命令。
@@ -127,8 +127,14 @@ cd code && AUTH_MODE=header .venv/bin/uvicorn percolation.api:app --host 127.0.0
 | --- | --- |
 | `GET /v1/session` | 不要求登录：`logged_in`、脱敏账号、登录方式与协议版本、`console`（是否有控制台权限） |
 | `POST /v1/session/forget` | 网页退出登录前调用，清掉本进程对该 cookie 的缓存 |
-| `POST /v1/capture` | 录入，返回 `msg_seq` 等，另带 `note`（网页展示用） |
-| `POST /v1/search` | 检索，返回 `SearchOutcome`，另带 `step`（网页线程的一步：回答、追问、依据序号、依据主题页标题） |
+| `POST /v1/capture` | 录入，返回 `msg_seq` 等，另带 `note`（网页展示用。含 `edited_at`、`revisions`、`ever_archived`、`cited`） |
+| `PATCH /v1/notes/{seq}` | 修订一条未删除原话，返回最新 `note` 和 `revisions`（`rev` / `prev` / `next` / `at`）。正文没变时不另记一版 |
+| `GET /v1/notes/{seq}/revisions` | 这条原话的修订历史。记录不存在或已删除时 404 |
+| `POST /v1/notes/delete` | `{seqs}` 软删除，返回实际新标为删除的 `deleted`。列表、检索、召回立刻看不见 |
+| `POST /v1/notes/restore` | 撤销尚未抹除的删除，返回 `restored` 和对应 `notes` |
+| `POST /v1/search` | 检索，返回 `SearchOutcome`，另带 `step`（网页线程的一步：回答、追问、依据序号、依据主题页标题、`query`、`reask`、`deleted_seqs`、`updated_seqs`）。可选 `reask_of`：改了再问，新的一步挂到原线程根上，旧回答保留 |
+| `POST /v1/threads/{id}/delete` | 软删除整条问答（第一问和后续重查），返回 `{ok}` |
+| `POST /v1/threads/{id}/restore` | 撤销整条问答的删除，返回 `{ok}` |
 | `POST /v1/clarify` | 回复追问：澄清原话入库 + 原问题重查（`parent_search_id` 指向线程第一问），另带 `note`、`step` |
 | `GET /v1/notes?before_seq=&limit=` | 记录分页（正序返回，首页带 `total`） |
 | `GET /v1/notes/search?q=` | 在记录里找原话：空格分开的词都要出现（不区分大小写）；中文整句没命中时切成记录里出现过的二字组再匹配（返回的 `terms` 即实际用的词）；最多返回最近 200 条；另用 `recall` 补最多 5 条 `near: true`（意思相近）。每条带 `pos`（在全部原话里的名次），另返回 `matched`、`total`、`capped`、`terms` |
@@ -141,6 +147,6 @@ cd code && AUTH_MODE=header .venv/bin/uvicorn percolation.api:app --host 127.0.0
 | `GET /healthz` | 数据库连通性 |
 | `GET /console/*` | Percolation 控制台页面与静态资源（见 `code/console/README.md`）；线上仅 `CONSOLE_PHONE_WHITELIST` 白名单手机号可见（未登录 401 / 非白名单 403） |
 
-每个账号滚动 24 小时内询问（含澄清重查）默认 200 次、记录 1000 条，超出回 429（`DAILY_ASK_LIMIT` / `DAILY_CAPTURE_LIMIT`，0 为不限）。检索或澄清内部出错时回 502，详情只进服务日志（`journalctl -u percolation-api`）。
+每个账号滚动 24 小时内询问（含澄清重查和改了再问）默认 200 次、记录 1000 条，超出回 429（`DAILY_ASK_LIMIT` / `DAILY_CAPTURE_LIMIT`，0 为不限）。检索或澄清内部出错时回 502，详情只进服务日志（`journalctl -u percolation-api`）。
 
 改了 `code/percolation` 或 `config/*.env` 后 `systemctl restart percolation-api`（重启期间约 3 秒不可用，正在进行的询问会中断）；只改 `code/web` 不用重启。

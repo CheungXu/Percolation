@@ -856,6 +856,40 @@ textarea {
   font-variant-numeric: tabular-nums;
 }
 
+.find-tool {
+  display: none;
+  align-items: center;
+  height: 26px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 7px;
+  background: none;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.find-tool.on {
+  display: inline-flex;
+}
+
+.find-tool:hover {
+  background: var(--canvas);
+  color: var(--ink);
+}
+
+.find-tool.danger.on {
+  color: var(--danger);
+}
+
+.find-tool.danger:hover {
+  background: rgba(220, 38, 38, 0.08);
+  color: var(--danger);
+}
+
 .find-close {
   width: 26px;
   height: 26px;
@@ -1027,32 +1061,235 @@ textarea {
 }
 
 .note-side {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.note-slot {
   display: grid;
   justify-items: end;
 }
 
-.note-side > * {
+.note-slot > * {
   grid-area: 1 / 1;
+}
+
+.note-hover {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 1px;
+  opacity: 0;
   transition: opacity 0.15s;
 }
 
+.note-hover button {
+  border: none;
+  background: none;
+  padding: 0 4px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.note-hover button:hover {
+  color: var(--ink);
+}
+
+.note-hover button[data-note-del]:hover {
+  color: var(--danger);
+}
+
+.note:hover .note-hover,
+.note:focus-within .note-hover,
+.note.cur .note-hover {
+  opacity: 1;
+}
+
 .note-go {
-  margin-top: 2px;
+  margin-top: 0;
+  padding-left: 4px;
   font-size: 12px;
   font-weight: 500;
   color: var(--green);
   white-space: nowrap;
+}
+
+.note:hover .note-time,
+.note:focus-within .note-time,
+.note.cur .note-time {
   opacity: 0;
 }
 
-.note.hit:hover .note-go,
-.note.cur .note-go {
+.note-rev {
+  border: none;
+  background: none;
+  margin-top: 2px;
+  padding: 0;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--green);
+  cursor: pointer;
+}
+
+.note-rev.on {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.note.editing {
   opacity: 1;
 }
 
-.note.hit:hover .note-time,
-.note.cur .note-time {
-  opacity: 0;
+.note.editing .note-dot {
+  background: var(--surface);
+  box-shadow: 0 0 0 3px var(--surface), inset 0 0 0 1.5px var(--green);
+}
+
+.note-edit {
+  display: block;
+  width: 100%;
+  border: none;
+  outline: none;
+  resize: none;
+  padding: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--ink);
+  line-height: inherit;
+}
+
+.edit-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--faint);
+}
+
+.rev-pop {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rev-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+  color: var(--faint);
+}
+
+.rev-row s {
+  color: var(--muted);
+  text-decoration-thickness: 1px;
+}
+
+.rev-row.faint {
+  color: var(--faint);
+}
+
+.note.tomb {
+  opacity: 1;
+  min-height: 36px;
+  align-items: center;
+}
+
+.note.tomb .note-dot {
+  background: transparent;
+  box-shadow: none;
+}
+
+.tomb-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 999px;
+  padding: 4px 12px;
+  background: none;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+button.tomb-line {
+  cursor: pointer;
+}
+
+.tomb-line button {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--green);
+  font: inherit;
+  cursor: pointer;
+}
+
+.pick {
+  width: 16px;
+  height: 16px;
+  margin-top: 3px;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--panel);
+  cursor: pointer;
+}
+
+.pick.on {
+  background: var(--green);
+  border-color: var(--green);
+  box-shadow: inset 0 0 0 2.5px var(--panel);
+}
+
+.note.picked {
+  background: rgba(15, 157, 118, 0.06);
+}
+
+.hold-bar {
+  position: absolute;
+  z-index: 6;
+  top: calc(100% - 4px);
+  left: 28px;
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: 0 10px 28px rgba(17, 24, 39, 0.12), inset 0 0 0 1px var(--line);
+}
+
+.hold-bar button {
+  height: 32px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.hold-bar button:hover {
+  background: var(--canvas);
+}
+
+.hold-bar button.danger {
+  color: var(--danger);
+}
+
+.holding .note:not(.held),
+.holding .qa:not(:has(.held)) {
+  opacity: calc(var(--dim) * 0.35);
 }
 
 .find-foot {
@@ -1128,6 +1365,103 @@ textarea {
   background: #3b4352;
   padding: 8px 14px;
   font-size: 14px;
+}
+
+.q-wrap {
+  position: relative;
+  align-self: flex-end;
+  max-width: 80%;
+}
+
+.q-wrap > .q {
+  max-width: none;
+}
+
+.q-ops {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 2px);
+  display: flex;
+  gap: 10px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.q-wrap:hover .q-ops,
+.q-wrap:focus-within .q-ops {
+  opacity: 1;
+}
+
+.q-ops button {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.q-ops button:hover {
+  color: var(--ink);
+}
+
+.q-ops button[data-thread-del]:hover {
+  color: var(--danger);
+}
+
+.q-wrap .hold-bar {
+  left: auto;
+  right: 0;
+}
+
+.q-reask {
+  background: #3b4352;
+}
+
+.reask-form {
+  align-self: flex-end;
+  width: min(80%, 460px);
+  padding: 10px 16px;
+  border-radius: 18px 18px 6px 18px;
+  background: var(--ink);
+}
+
+.reask-edit {
+  display: block;
+  width: 100%;
+  border: none;
+  outline: none;
+  resize: none;
+  padding: 0;
+  background: transparent;
+  color: #fff;
+  font: inherit;
+  font-size: 14.5px;
+  line-height: 1.5;
+}
+
+.reask-form .edit-hint {
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.past-toggle {
+  align-self: flex-start;
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.past-toggle:hover {
+  color: var(--indigo);
+}
+
+.qa.tomb {
+  opacity: 1;
 }
 
 .a {
@@ -1276,6 +1610,25 @@ textarea {
   border-color: var(--indigo-line);
   color: var(--indigo);
   background: var(--indigo-soft);
+}
+
+.cue.gone,
+.cue.stale {
+  border-style: dashed;
+  color: var(--faint);
+  cursor: default;
+}
+
+.cue.gone:hover,
+.cue.stale:hover {
+  border-color: var(--line);
+  color: var(--faint);
+  background: var(--panel);
+}
+
+.cue.reask {
+  color: var(--indigo);
+  border-color: var(--indigo-line);
 }
 
 .clarify {
@@ -2010,6 +2363,21 @@ textarea {
   }
 
   .find-bar input {
+    font-size: 16px;
+  }
+
+  .note-hover,
+  .q-ops {
+    display: none;
+  }
+
+  .note:hover .note-time,
+  .note.cur .note-time {
+    opacity: 1;
+  }
+
+  .note-edit,
+  .reask-edit {
     font-size: 16px;
   }
 
